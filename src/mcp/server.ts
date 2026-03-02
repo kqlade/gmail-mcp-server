@@ -36,6 +36,55 @@ function getMcpUserId(extra: { authInfo?: unknown }): string {
 // Reusable email schema for selecting which Gmail account to use
 const emailSchema = z.string().email().optional().describe('Email address of the Gmail account to use. If not specified, uses the default account.');
 
+// Structured search fields shared by searchMessages, listThreads, and batch items.
+// The server compiles these into a Gmail query string so the caller doesn't need
+// to know Gmail search syntax.
+const structuredSearchFields = {
+  from: z.string().optional().describe('Sender name or email address (e.g. "github", "notifications@github.com")'),
+  to: z.string().optional().describe('Recipient email address'),
+  subject: z.string().optional().describe('Words in the subject line'),
+  after: z.string().optional().describe('Messages after this date (YYYY-MM-DD)'),
+  before: z.string().optional().describe('Messages before this date (YYYY-MM-DD)'),
+  label: z.string().optional().describe('Gmail label name to filter by'),
+  hasAttachment: z.boolean().optional().describe('Only messages with attachments'),
+  scope: z.enum(['default', 'inbox', 'trash', 'spam', 'anywhere']).optional()
+    .describe('Where to search. "default" (the default) = everything except trash and spam. "inbox" = only inbox. "trash"/"spam" = only that location. "anywhere" = everything including trash and spam.'),
+};
+
+type StructuredSearchParams = {
+  from?: string;
+  to?: string;
+  subject?: string;
+  after?: string;
+  before?: string;
+  label?: string;
+  hasAttachment?: boolean;
+  scope?: string;
+  query?: string;
+};
+
+function buildSearchQuery(params: StructuredSearchParams): string {
+  const parts: string[] = [];
+  if (params.from) parts.push(`from:${params.from}`);
+  if (params.to) parts.push(`to:${params.to}`);
+  if (params.subject) parts.push(`subject:(${params.subject})`);
+  if (params.after) parts.push(`after:${params.after}`);
+  if (params.before) parts.push(`before:${params.before}`);
+  if (params.label) parts.push(`label:${params.label}`);
+  if (params.hasAttachment) parts.push('has:attachment');
+
+  switch (params.scope) {
+    case 'inbox': parts.push('in:inbox'); break;
+    case 'trash': parts.push('in:trash'); break;
+    case 'spam': parts.push('in:spam'); break;
+    case 'anywhere': parts.push('in:anywhere'); break;
+    // 'default' and undefined: no qualifier — Gmail excludes trash/spam automatically
+  }
+
+  if (params.query) parts.push(params.query);
+  return parts.join(' ');
+}
+
 // Helper to format error responses
 function formatError(error: unknown): { content: Array<{ type: 'text'; text: string }>; isError: true } {
   let code = -32603; // Internal error default
@@ -188,14 +237,17 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     'gmail.searchMessages',
     {
       description:
-        'Search messages using Gmail query syntax. Two modes:\n' +
-        '- Single search: pass "query" (string) with optional maxResults/pageToken\n' +
-        '- Batch search: pass "queries" (array of {query, maxResults?}) to run multiple searches in parallel\n' +
-        'Provide exactly one of "query" or "queries".',
+        'Search messages. Prefer structured fields (from, to, subject, after, before, scope) over raw query.\n' +
+        'Two modes:\n' +
+        '- Single search: pass structured fields and/or "query" with optional maxResults/pageToken\n' +
+        '- Batch search: pass "queries" array to run multiple searches in parallel\n' +
+        'For single search, structured fields and "query" are merged. For batch, each item can use structured fields and/or "query".',
       inputSchema: {
-        query: z.string().optional().describe('Gmail search query (for single search)'),
+        ...structuredSearchFields,
+        query: z.string().optional().describe('Raw Gmail query to merge with structured fields (for single search)'),
         queries: z.array(z.object({
-          query: z.string().describe('Gmail search query'),
+          ...structuredSearchFields,
+          query: z.string().optional().describe('Raw Gmail query to merge with structured fields'),
           maxResults: z.number().int().min(1).max(100).optional().describe('Max results for this query (default 20)'),
         })).min(1).max(10).optional().describe('Array of search queries for batch search (max 10)'),
         maxResults: z.number().int().min(1).max(100).optional().describe('Maximum results for single search (1-100, default 20)'),
@@ -205,19 +257,15 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     },
     async (args, extra) => {
       const mcpUserId = getMcpUserId(extra);
-      const hasQuery = typeof args.query === 'string';
       const hasQueries = Array.isArray(args.queries) && args.queries.length > 0;
-
-      if (hasQuery === hasQueries) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Provide exactly one of "query" or "queries"', code: -32602 }) }],
-          isError: true,
-        };
-      }
 
       try {
         if (hasQueries) {
-          const results = await gmailClient.batchSearchMessages(mcpUserId, args.queries!, args.email);
+          const builtQueries = args.queries!.map((q: StructuredSearchParams & { maxResults?: number }) => ({
+            query: buildSearchQuery(q),
+            maxResults: q.maxResults,
+          }));
+          const results = await gmailClient.batchSearchMessages(mcpUserId, builtQueries, args.email);
           return {
             content: [{
               type: 'text' as const,
@@ -230,9 +278,17 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
           };
         }
 
+        const builtQuery = buildSearchQuery(args as StructuredSearchParams);
+        if (!builtQuery.trim()) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Provide at least one search parameter (from, subject, query, etc.)', code: -32602 }) }],
+            isError: true,
+          };
+        }
+
         const result = await gmailClient.searchMessages(
           mcpUserId,
-          args.query!,
+          builtQuery,
           args.maxResults ?? 20,
           args.pageToken,
           args.email
@@ -293,9 +349,10 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
   server.registerTool(
     'gmail.listThreads',
     {
-      description: 'List conversation threads, optionally filtered by query',
+      description: 'List conversation threads, optionally filtered. Prefer structured fields (from, subject, scope, etc.) over raw query.',
       inputSchema: {
-        query: z.string().optional().describe('Optional Gmail search query'),
+        ...structuredSearchFields,
+        query: z.string().optional().describe('Raw Gmail query to merge with structured fields'),
         maxResults: z.number().int().min(1).max(100).optional().describe('Maximum results (1-100, default 20)'),
         pageToken: z.string().optional().describe('Token for pagination'),
         email: emailSchema,
@@ -305,9 +362,10 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
       const mcpUserId = getMcpUserId(extra);
 
       try {
+        const builtQuery = buildSearchQuery(args as StructuredSearchParams) || undefined;
         const result = await gmailClient.listThreads(
           mcpUserId,
-          args.query,
+          builtQuery,
           args.maxResults ?? 20,
           args.pageToken,
           args.email
@@ -503,7 +561,9 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
               result = await gmailClient.removeLabels(mcpUserId, messageIds, threadIds, item.labelIds, args.email);
               break;
           }
-          results.push({ action: item.action, ok: true, result });
+          const batchResult = result as { failureCount?: number } | undefined;
+          const hasFailures = typeof batchResult?.failureCount === 'number' && batchResult.failureCount > 0;
+          results.push({ action: item.action, ok: !hasFailures, result });
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Unknown error';
           results.push({ action: item.action, ok: false, error: message });

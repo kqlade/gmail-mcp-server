@@ -1353,68 +1353,86 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
 
   /**
    * Trash messages or threads (move to Trash).
+   * Returns per-item status so callers can distinguish success, already_trashed, not_found, and errors.
    */
   async function trashMessages(
     mcpUserId: string,
     messageIds?: string[],
     threadIds?: string[],
     email?: string
-  ): Promise<{ success: boolean; trashed: number }> {
+  ): Promise<BatchModifyResult> {
     await checkScope(mcpUserId, GMAIL_MODIFY_SCOPE, email);
     const gmail = await getGmailClient(mcpUserId, email);
 
-    const promises: Promise<void>[] = [];
+    const promises: Promise<ModifyResult>[] = [];
 
     if (messageIds?.length) {
       for (const id of messageIds) {
-        promises.push(gmail.users.messages.trash({ userId: 'me', id }).then(() => {}));
+        promises.push(
+          gmail.users.messages.trash({ userId: 'me', id })
+            .then(() => ({ id, success: true as const }))
+            .catch((error: unknown) => classifyOrganizeError(id, error))
+        );
       }
     }
     if (threadIds?.length) {
       for (const id of threadIds) {
-        promises.push(gmail.users.threads.trash({ userId: 'me', id }).then(() => {}));
+        promises.push(
+          gmail.users.threads.trash({ userId: 'me', id })
+            .then(() => ({ id, success: true as const }))
+            .catch((error: unknown) => classifyOrganizeError(id, error))
+        );
       }
     }
 
-    try {
-      await Promise.all(promises);
-      return { success: true, trashed: promises.length };
-    } catch (error: unknown) {
-      throw wrapGmailError(error);
-    }
+    const results = await Promise.all(promises);
+    return {
+      results,
+      successCount: results.filter(r => r.success).length,
+      failureCount: results.filter(r => !r.success).length,
+    };
   }
 
   /**
    * Untrash messages or threads (move out of Trash back to inbox).
+   * Returns per-item status so callers can distinguish success, not_found, and errors.
    */
   async function untrashMessages(
     mcpUserId: string,
     messageIds?: string[],
     threadIds?: string[],
     email?: string
-  ): Promise<{ success: boolean; untrashed: number }> {
+  ): Promise<BatchModifyResult> {
     await checkScope(mcpUserId, GMAIL_MODIFY_SCOPE, email);
     const gmail = await getGmailClient(mcpUserId, email);
 
-    const promises: Promise<void>[] = [];
+    const promises: Promise<ModifyResult>[] = [];
 
     if (messageIds?.length) {
       for (const id of messageIds) {
-        promises.push(gmail.users.messages.untrash({ userId: 'me', id }).then(() => {}));
+        promises.push(
+          gmail.users.messages.untrash({ userId: 'me', id })
+            .then(() => ({ id, success: true as const }))
+            .catch((error: unknown) => classifyOrganizeError(id, error))
+        );
       }
     }
     if (threadIds?.length) {
       for (const id of threadIds) {
-        promises.push(gmail.users.threads.untrash({ userId: 'me', id }).then(() => {}));
+        promises.push(
+          gmail.users.threads.untrash({ userId: 'me', id })
+            .then(() => ({ id, success: true as const }))
+            .catch((error: unknown) => classifyOrganizeError(id, error))
+        );
       }
     }
 
-    try {
-      await Promise.all(promises);
-      return { success: true, untrashed: promises.length };
-    } catch (error: unknown) {
-      throw wrapGmailError(error);
-    }
+    const results = await Promise.all(promises);
+    return {
+      results,
+      successCount: results.filter(r => r.success).length,
+      failureCount: results.filter(r => !r.success).length,
+    };
   }
 
   /**
@@ -1597,6 +1615,21 @@ function extractBody(
 
   processPartRecursive(payload);
   return result;
+}
+
+function classifyOrganizeError(id: string, error: unknown): ModifyResult {
+  const gmailError = error as { code?: number; message?: string };
+  const status = gmailError.code ?? 500;
+  if (status === 404) {
+    return { id, success: false, error: 'not_found' };
+  }
+  if (status === 400) {
+    const msg = (gmailError.message ?? '').toLowerCase();
+    if (msg.includes('already') || msg.includes('invalid')) {
+      return { id, success: false, error: 'already_in_state' };
+    }
+  }
+  return { id, success: false, error: gmailError.message ?? 'unknown_error' };
 }
 
 function wrapGmailError(error: unknown): GmailApiError {
