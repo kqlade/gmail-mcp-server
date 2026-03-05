@@ -693,11 +693,14 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
    */
   async function checkScope(mcpUserId: string, requiredScope: string, email?: string): Promise<void> {
     const credentials = await getValidCredentials(mcpUserId, email);
-    const grantedScopes = credentials.scope.split(' ');
+    const grantedScopes = new Set(credentials.scope.split(' '));
 
-    if (!grantedScopes.includes(requiredScope)) {
-      throw new InsufficientScopeError('gmail.labels');
-    }
+    if (grantedScopes.has(requiredScope)) return;
+
+    // gmail.modify is a superset that includes labels, compose, and readonly
+    if (grantedScopes.has(GMAIL_MODIFY_SCOPE)) return;
+
+    throw new InsufficientScopeError(requiredScope);
   }
 
   /**
