@@ -85,8 +85,27 @@ function buildSearchQuery(params: StructuredSearchParams): string {
   return parts.join(' ');
 }
 
+function formatToolResult<T extends object>(payload: T): {
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent: Record<string, unknown>;
+} {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(payload),
+      },
+    ],
+    structuredContent: payload as Record<string, unknown>,
+  };
+}
+
 // Helper to format error responses
-function formatError(error: unknown): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+function formatError(error: unknown): {
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent: Record<string, unknown>;
+  isError: true;
+} {
   let code = -32603; // Internal error default
   let message = 'An unexpected error occurred';
   let data: Record<string, unknown> | undefined;
@@ -105,13 +124,9 @@ function formatError(error: unknown): { content: Array<{ type: 'text'; text: str
     message = error.message;
   }
 
+  const payload = { error: message, code, ...(data && { data }) };
   return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify({ error: message, code, ...(data && { data }) }),
-      },
-    ],
+    ...formatToolResult(payload),
     isError: true,
   };
 }
@@ -266,22 +281,23 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
             maxResults: q.maxResults,
           }));
           const results = await gmailClient.batchSearchMessages(mcpUserId, builtQueries, args.email);
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                results,
-                queryCount: results.length,
-                totalMessages: results.reduce((sum: number, r: { result: { messages: unknown[] } }) => sum + r.result.messages.length, 0),
-              }),
-            }],
-          };
+          return formatToolResult({
+            results,
+            queryCount: results.length,
+            totalMessages: results.reduce(
+              (sum: number, r: { result: { messages: unknown[] } }) => sum + r.result.messages.length,
+              0,
+            ),
+          });
         }
 
         const builtQuery = buildSearchQuery(args as StructuredSearchParams);
         if (!builtQuery.trim()) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Provide at least one search parameter (from, subject, query, etc.)', code: -32602 }) }],
+            ...formatToolResult({
+              error: 'Provide at least one search parameter (from, subject, query, etc.)',
+              code: -32602,
+            }),
             isError: true,
           };
         }
@@ -293,7 +309,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
           args.pageToken,
           args.email
         );
-        return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        return formatToolResult(result);
       } catch (error) {
         return formatError(error);
       }
@@ -330,15 +346,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
             includeHtml: args.includeHtml,
           }
         );
-
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(message),
-            },
-          ],
-        };
+        return formatToolResult(message);
       } catch (error) {
         return formatError(error);
       }
@@ -370,15 +378,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
           args.pageToken,
           args.email
         );
-
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(result),
-            },
-          ],
-        };
+        return formatToolResult(result);
       } catch (error) {
         return formatError(error);
       }
@@ -406,15 +406,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
           args.format ?? 'metadata',
           args.email
         );
-
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({ messages }),
-            },
-          ],
-        };
+        return formatToolResult({ messages });
       } catch (error) {
         return formatError(error);
       }
@@ -505,17 +497,12 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
           args.email
         );
 
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              threadCount: result.threads.length,
-              hasMore: Boolean(result.nextPageToken),
-              nextPageToken: result.nextPageToken ?? undefined,
-              threads: result.threads,
-            }),
-          }],
-        };
+        return formatToolResult({
+          threadCount: result.threads.length,
+          hasMore: Boolean(result.nextPageToken),
+          nextPageToken: result.nextPageToken ?? undefined,
+          threads: result.threads,
+        });
       } catch (error) {
         return formatError(error);
       }
@@ -644,7 +631,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
 
       try {
         const result = await gmailClient.getLabelInfo(mcpUserId, args.labelId, args.email);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        return formatToolResult(result);
       } catch (error) {
         return formatError(error);
       }
@@ -665,7 +652,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
 
       try {
         const result = await gmailClient.listLabels(mcpUserId, args?.email);
-        return { content: [{ type: 'text' as const, text: JSON.stringify({ labels: result }) }] };
+        return formatToolResult({ labels: result });
       } catch (error) {
         return formatError(error);
       }
