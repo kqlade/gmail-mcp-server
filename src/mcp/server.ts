@@ -285,9 +285,11 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
             results,
             queryCount: results.length,
             totalMessages: results.reduce(
-              (sum: number, r: { result: { messages: unknown[] } }) => sum + r.result.messages.length,
+              (sum: number, r: { result?: { messages?: unknown[] } }) =>
+                sum + (Array.isArray(r.result?.messages) ? r.result.messages.length : 0),
               0,
             ),
+            failedQueries: results.filter((r: { error?: string }) => typeof r.error === 'string').length,
           });
         }
 
@@ -357,7 +359,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
   server.registerTool(
     'gmail.listThreads',
     {
-      description: 'List conversation threads, optionally filtered. Prefer structured fields (from, subject, scope, etc.) over raw query.',
+      description: 'List conversation threads (id, snippet). Use gmail.getThread for full metadata on specific threads. Prefer structured fields (from, subject, scope, etc.) over raw query.',
       inputSchema: {
         ...structuredSearchFields,
         query: z.string().optional().describe('Raw Gmail query to merge with structured fields'),
@@ -467,11 +469,9 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     'gmail.triageSnapshot',
     {
       description:
-        'Get a triage-ready inbox snapshot in one call. Returns thread metadata ' +
-        '(subject, from, date, snippet, messageCount) for up to maxResults inbox threads. ' +
-        'Designed for email triage workflows — provides enough context to classify and ' +
-        'plan actions without fetching full thread bodies. ' +
-        'Use pageToken to paginate through large inboxes.',
+        'Get a triage-ready inbox snapshot in one call. Returns thread IDs and snippets ' +
+        'for up to maxResults inbox threads. Use gmail.getThread on specific items for ' +
+        'subject/from/date. Use pageToken to paginate through large inboxes.',
       inputSchema: {
         ...structuredSearchFields,
         query: z.string().optional().describe('Raw Gmail query to merge with structured fields'),
@@ -642,7 +642,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
   server.registerTool(
     'gmail.listLabels',
     {
-      description: 'List all labels with their message counts',
+      description: 'List all labels (id, name, type). Use gmail.getLabelInfo for message counts on a specific label.',
       inputSchema: {
         email: emailSchema,
       },

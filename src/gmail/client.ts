@@ -55,11 +55,7 @@ export interface AttachmentMetadata {
 export interface SearchResultMessage {
   id: string;
   threadId: string;
-  threadMessageCount?: number;
   snippet?: string;
-  subject?: string;
-  from?: string;
-  date?: string;
 }
 
 export interface SearchResult {
@@ -67,13 +63,16 @@ export interface SearchResult {
   nextPageToken?: string;
 }
 
+export interface BatchSearchResult {
+  query: string;
+  result?: SearchResult;
+  error?: string;
+}
+
 export interface ThreadListItem {
   id: string;
   snippet?: string;
-  subject?: string;
-  from?: string;
-  date?: string;
-  messageCount?: number;
+  historyId?: string;
 }
 
 export interface ThreadResult {
@@ -96,6 +95,10 @@ export interface BatchModifyResult {
 export interface LabelInfo {
   id: string;
   name: string;
+  type?: string;
+}
+
+export interface LabelDetailedInfo extends LabelInfo {
   messagesTotal: number;
   messagesUnread: number;
   threadsTotal: number;
@@ -105,12 +108,14 @@ export interface LabelInfo {
 export interface DraftInfo {
   id: string;
   messageId: string;
+}
+
+export interface DraftContent {
+  id: string;
+  messageId: string;
   snippet: string;
   subject?: string;
   to?: string;
-}
-
-export interface DraftContent extends DraftInfo {
   body?: {
     text?: string;
     html?: string;
@@ -170,6 +175,7 @@ async function withGmailConcurrency<T>(fn: () => Promise<T>): Promise<T> {
 
 const MAX_GMAIL_RETRIES = 2;
 const RETRY_BASE_MS = 500;
+const MAX_CONCURRENT_BATCH_SEARCHES = 2;
 
 function isTransientGmailError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -208,6 +214,30 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
       throw error;
     }
   }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+
+  const concurrency = Math.max(1, Math.min(limit, items.length));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= items.length) return;
+      results[currentIndex] = await mapper(items[currentIndex]!, currentIndex);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return results;
 }
 
 /**
@@ -336,8 +366,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
 
   /**
    * Search messages using Gmail query syntax.
-   * Returns messages with metadata (snippet, subject, from, date).
-   * Uses parallel fetching for improved performance.
+   * Returns thread IDs + snippets from a single threads.list call -- no fan-out.
    */
   async function searchMessages(
     mcpUserId: string,
@@ -346,93 +375,15 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     pageToken?: string,
     email?: string
   ): Promise<SearchResult> {
-    const gmail = await getGmailClient(mcpUserId, email);
-
-    try {
-      const response = await gmail.users.messages.list({
-        userId: 'me',
-        q: query,
-        maxResults,
-        pageToken,
-      });
-
-      const messageList = response.data.messages ?? [];
-
-      // Collect unique thread IDs for batch fetching thread info
-      const threadIds = new Set<string>();
-      const validMessages = messageList.filter(m => m.id && m.threadId);
-      validMessages.forEach(m => threadIds.add(m.threadId!));
-
-      // Fetch metadata for all messages in parallel
-      const metadataPromises = validMessages.map(async (m) => {
-        try {
-          const msgResponse = await gmail.users.messages.get({
-            userId: 'me',
-            id: m.id!,
-            format: 'metadata',
-            metadataHeaders: ['From', 'Subject', 'Date'],
-          });
-
-          const headers = msgResponse.data.payload?.headers ?? [];
-          const fromHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'from');
-          const subjectHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'subject');
-          const dateHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'date');
-
-          return {
-            id: m.id!,
-            threadId: m.threadId!,
-            snippet: msgResponse.data.snippet ?? undefined,
-            subject: subjectHeader?.value ?? undefined,
-            from: fromHeader?.value ?? undefined,
-            date: dateHeader?.value ?? undefined,
-          } as SearchResultMessage;
-        } catch {
-          // If metadata fetch fails, include basic info
-          return {
-            id: m.id!,
-            threadId: m.threadId!,
-          } as SearchResultMessage;
-        }
-      });
-
-      // Fetch thread info for all threads in parallel
-      const threadInfoPromises = Array.from(threadIds).map(async (threadId) => {
-        try {
-          const threadResponse = await gmail.users.threads.get({
-            userId: 'me',
-            id: threadId,
-            format: 'minimal',
-          });
-          return { threadId, count: threadResponse.data.messages?.length ?? 1 };
-        } catch {
-          return { threadId, count: 1 };
-        }
-      });
-
-      // Wait for all parallel operations to complete
-      const [messages, threadInfoResults] = await Promise.all([
-        Promise.all(metadataPromises),
-        Promise.all(threadInfoPromises),
-      ]);
-
-      // Build thread info map from results
-      const threadInfoMap = new Map<string, number>();
-      for (const { threadId, count } of threadInfoResults) {
-        threadInfoMap.set(threadId, count);
-      }
-
-      // Attach thread message counts to results
-      for (const msg of messages) {
-        msg.threadMessageCount = threadInfoMap.get(msg.threadId) ?? 1;
-      }
-
-      return {
-        messages,
-        nextPageToken: response.data.nextPageToken ?? undefined,
-      };
-    } catch (error: unknown) {
-      throw wrapGmailError(error);
-    }
+    const result = await listThreads(mcpUserId, query, maxResults, pageToken, email);
+    return {
+      messages: result.threads.map((thread) => ({
+        id: thread.id,
+        threadId: thread.id,
+        snippet: thread.snippet,
+      })),
+      nextPageToken: result.nextPageToken,
+    };
   }
 
   /**
@@ -443,14 +394,18 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     mcpUserId: string,
     queries: Array<{ query: string; maxResults?: number }>,
     email?: string
-  ): Promise<Array<{ query: string; result: SearchResult }>> {
-    const results = await Promise.all(
-      queries.map(async ({ query, maxResults }) => {
+  ): Promise<BatchSearchResult[]> {
+    return mapWithConcurrency(queries, MAX_CONCURRENT_BATCH_SEARCHES, async ({ query, maxResults }) => {
+      try {
         const result = await searchMessages(mcpUserId, query, maxResults ?? 20, undefined, email);
         return { query, result };
-      })
-    );
-    return results;
+      } catch (error) {
+        return {
+          query,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    });
   }
 
   /**
@@ -536,11 +491,9 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
   }
 
   /**
-   * List threads with enriched metadata.
-   *
-   * After listing thread IDs, fetches the latest message's metadata
-   * (subject, from, date) for each thread in parallel. This eliminates
-   * the N+1 problem where callers had to individually fetch each thread.
+   * List threads. Returns only what threads.list provides (id, snippet, historyId)
+   * -- one HTTP call, no per-thread enrichment fan-out.
+   * Callers that need Subject/From/Date should call getThread on specific items.
    */
   async function listThreads(
     mcpUserId: string,
@@ -559,50 +512,16 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
         pageToken,
       });
 
-      const rawThreads = response.data.threads ?? [];
-
-      const enriched = await Promise.all(
-        rawThreads.filter(t => t.id).map(async (t) => {
-          try {
-            const threadResponse = await gmail.users.threads.get({
-              userId: 'me',
-              id: t.id!,
-              format: 'metadata',
-              metadataHeaders: ['From', 'Subject', 'Date'],
-            });
-
-            const messages = threadResponse.data.messages ?? [];
-            const latest = messages[messages.length - 1];
-            const headers = latest?.payload?.headers ?? [];
-            const fromHeader = headers.find(
-              (h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'from'
-            );
-            const subjectHeader = headers.find(
-              (h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'subject'
-            );
-            const dateHeader = headers.find(
-              (h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'date'
-            );
-
-            return {
-              id: t.id!,
-              snippet: t.snippet ?? latest?.snippet ?? undefined,
-              subject: subjectHeader?.value ?? undefined,
-              from: fromHeader?.value ?? undefined,
-              date: dateHeader?.value ?? undefined,
-              messageCount: messages.length,
-            } as ThreadListItem;
-          } catch {
-            return {
-              id: t.id!,
-              snippet: t.snippet ?? undefined,
-            } as ThreadListItem;
-          }
-        })
-      );
+      const threads: ThreadListItem[] = (response.data.threads ?? [])
+        .filter(t => t.id)
+        .map(t => ({
+          id: t.id!,
+          snippet: t.snippet ?? undefined,
+          historyId: t.historyId ?? undefined,
+        }));
 
       return {
-        threads: enriched,
+        threads,
         nextPageToken: response.data.nextPageToken ?? undefined,
       };
     } catch (error: unknown) {
@@ -706,8 +625,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
   ): Promise<string[]> {
     const gmail = await getGmailClient(mcpUserId, email);
 
-    const results = await Promise.all(
-      messageIds.map(async (messageId) => {
+    const results = await mapWithConcurrency(messageIds, MAX_CONCURRENT_GMAIL_CALLS, async (messageId) => {
         try {
           const response = await gmail.users.messages.get({
             userId: 'me',
@@ -724,8 +642,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
           }
           return null;
         }
-      })
-    );
+      });
 
     // Collect unique threadIds, filtering out nulls
     const threadIds = new Set<string>();
@@ -860,7 +777,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       }
     }
 
-    const results = await Promise.all(promises);
+    const results = await mapWithConcurrency(promises, MAX_CONCURRENT_GMAIL_CALLS, async (promise) => promise);
 
     return {
       results,
@@ -941,9 +858,10 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
   // ============== LABEL METHODS ==============
 
   /**
-   * Get information about a label including message counts.
+   * Get detailed information about a single label including message counts.
+   * One HTTP call per invocation -- use this for targeted label stats.
    */
-  async function getLabelInfo(mcpUserId: string, labelId: string, email?: string): Promise<LabelInfo> {
+  async function getLabelInfo(mcpUserId: string, labelId: string, email?: string): Promise<LabelDetailedInfo> {
     const gmail = await getGmailClient(mcpUserId, email);
 
     try {
@@ -956,6 +874,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       return {
         id: label.id!,
         name: label.name!,
+        type: label.type ?? undefined,
         messagesTotal: label.messagesTotal ?? 0,
         messagesUnread: label.messagesUnread ?? 0,
         threadsTotal: label.threadsTotal ?? 0,
@@ -967,8 +886,9 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
   }
 
   /**
-   * List all labels.
-   * Uses parallel fetching for improved performance.
+   * List all labels. Returns only what labels.list provides (id, name, type)
+   * -- one HTTP call, no per-label fan-out.
+   * Use getLabelInfo for message counts on a specific label.
    */
   async function listLabels(mcpUserId: string, email?: string): Promise<LabelInfo[]> {
     const gmail = await getGmailClient(mcpUserId, email);
@@ -978,30 +898,13 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
         userId: 'me',
       });
 
-      const labels = response.data.labels ?? [];
-
-      // Fetch full info for all labels in parallel
-      const labelInfos = await Promise.all(
-        labels
-          .filter(label => label.id)
-          .map(async (label) => {
-            try {
-              return await getLabelInfo(mcpUserId, label.id!, email);
-            } catch {
-              // Return basic info for labels that fail (e.g., system labels without counts)
-              return {
-                id: label.id!,
-                name: label.name ?? label.id!,
-                messagesTotal: 0,
-                messagesUnread: 0,
-                threadsTotal: 0,
-                threadsUnread: 0,
-              };
-            }
-          })
-      );
-
-      return labelInfos;
+      return (response.data.labels ?? [])
+        .filter(label => label.id)
+        .map(label => ({
+          id: label.id!,
+          name: label.name ?? label.id!,
+          type: label.type ?? undefined,
+        }));
     } catch (error: unknown) {
       throw wrapGmailError(error);
     }
@@ -1244,8 +1147,9 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
   }
 
   /**
-   * List drafts.
-   * Uses parallel fetching for improved performance.
+   * List drafts. Returns only what drafts.list provides (id, message.id)
+   * -- one HTTP call, no per-draft fan-out.
+   * Use getDraft for full content on a specific draft.
    */
   async function listDrafts(
     mcpUserId: string,
@@ -1262,39 +1166,12 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
         pageToken,
       });
 
-      // Fetch draft details for all drafts in parallel
-      const drafts = await Promise.all(
-        (response.data.drafts ?? [])
-          .filter(draft => draft.id)
-          .map(async (draft) => {
-            try {
-              const draftDetail = await gmail.users.drafts.get({
-                userId: 'me',
-                id: draft.id!,
-                format: 'metadata',
-              });
-
-              const message = draftDetail.data.message;
-              const headers = message?.payload?.headers ?? [];
-              const subjectHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'subject');
-              const toHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'to');
-
-              return {
-                id: draft.id!,
-                messageId: message?.id ?? '',
-                snippet: message?.snippet ?? '',
-                subject: subjectHeader?.value ?? undefined,
-                to: toHeader?.value ?? undefined,
-              } as DraftInfo;
-            } catch {
-              return {
-                id: draft.id!,
-                messageId: draft.message?.id ?? '',
-                snippet: '',
-              } as DraftInfo;
-            }
-          })
-      );
+      const drafts: DraftInfo[] = (response.data.drafts ?? [])
+        .filter(draft => draft.id)
+        .map(draft => ({
+          id: draft.id!,
+          messageId: draft.message?.id ?? '',
+        }));
 
       return {
         drafts,
@@ -1490,7 +1367,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       }
     }
 
-    const results = await Promise.all(promises);
+    const results = await mapWithConcurrency(promises, MAX_CONCURRENT_GMAIL_CALLS, async (promise) => promise);
     return {
       results,
       successCount: results.filter(r => r.success).length,
@@ -1532,7 +1409,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       }
     }
 
-    const results = await Promise.all(promises);
+    const results = await mapWithConcurrency(promises, MAX_CONCURRENT_GMAIL_CALLS, async (promise) => promise);
     return {
       results,
       successCount: results.filter(r => r.success).length,
