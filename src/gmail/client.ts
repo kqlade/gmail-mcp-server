@@ -164,6 +164,52 @@ async function withGmailConcurrency<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Retry for transient Google API failures
+// ---------------------------------------------------------------------------
+
+const MAX_GMAIL_RETRIES = 2;
+const RETRY_BASE_MS = 500;
+
+function isTransientGmailError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  if (
+    msg.includes('unexpected end of json') ||
+    msg.includes('unterminated string in json') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout') ||
+    msg.includes('enotfound') ||
+    msg.includes('enetunreach') ||
+    msg.includes('eai_again') ||
+    msg.includes('fetch failed') ||
+    msg.includes('socket hang up') ||
+    msg.includes('aborted')
+  ) {
+    return true;
+  }
+  const status = (error as { code?: number }).code;
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+  return false;
+}
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt < MAX_GMAIL_RETRIES && isTransientGmailError(error)) {
+        const delay = RETRY_BASE_MS * 2 ** attempt + Math.floor(Math.random() * 250);
+        await new Promise<void>((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 /**
  * Create a Gmail client factory.
  */
@@ -273,7 +319,11 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       access_token: credentials.accessToken,
     });
 
-    const client = google.gmail({ version: 'v1', auth: oauth2Client });
+    const client = google.gmail({
+      version: 'v1',
+      auth: oauth2Client,
+      timeout: 60_000,
+    });
 
     // Cache client until token expires (with 1 minute buffer)
     clientCache.set(cacheKey, {
@@ -1532,11 +1582,11 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     await tokenStore.deleteCredentials(mcpUserId, accountEmail);
   }
 
-  // Wrap Gmail API methods with concurrency limiter
+  // Wrap Gmail API methods with concurrency limiter + transient-error retry
   function limited<TArgs extends unknown[], TResult>(
     fn: (...args: TArgs) => Promise<TResult>
   ): (...args: TArgs) => Promise<TResult> {
-    return (...args: TArgs) => withGmailConcurrency(() => fn(...args));
+    return (...args: TArgs) => withGmailConcurrency(() => withRetry(() => fn(...args)));
   }
 
   return {
