@@ -469,9 +469,9 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     'gmail.triageSnapshot',
     {
       description:
-        'Get a triage-ready inbox snapshot in one call. Returns thread IDs and snippets ' +
-        'for up to maxResults inbox threads. Use gmail.getThread on specific items for ' +
-        'subject/from/date. Use pageToken to paginate through large inboxes.',
+        'Get a triage-ready inbox snapshot in one call. Returns thread IDs with subject, ' +
+        'sender, date, snippet, and message count for up to maxResults inbox threads. ' +
+        'Use pageToken to paginate through large inboxes.',
       inputSchema: {
         ...structuredSearchFields,
         query: z.string().optional().describe('Raw Gmail query to merge with structured fields'),
@@ -489,7 +489,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
           scope: (args as StructuredSearchParams).scope ?? 'inbox',
         }) || 'in:inbox';
 
-        const result = await gmailClient.listThreads(
+        const result = await gmailClient.listThreadsEnriched(
           mcpUserId,
           builtQuery,
           args.maxResults ?? 25,

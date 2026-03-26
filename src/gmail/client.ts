@@ -73,6 +73,10 @@ export interface ThreadListItem {
   id: string;
   snippet?: string;
   historyId?: string;
+  subject?: string;
+  from?: string;
+  date?: string;
+  messageCount?: number;
 }
 
 export interface ThreadResult {
@@ -527,6 +531,54 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     } catch (error: unknown) {
       throw wrapGmailError(error);
     }
+  }
+
+  /**
+   * List threads with lightweight header enrichment (Subject, From, Date).
+   *
+   * Calls threads.list for IDs, then threads.get with format=metadata on each
+   * thread to pull the first message's Subject and the last message's From/Date.
+   * Enrichment failures are swallowed per-thread so the overall list still returns.
+   */
+  const TRIAGE_ENRICHMENT_CONCURRENCY = 3;
+
+  async function listThreadsEnriched(
+    mcpUserId: string,
+    query?: string,
+    maxResults: number = 20,
+    pageToken?: string,
+    email?: string
+  ): Promise<ThreadResult> {
+    const result = await listThreads(mcpUserId, query, maxResults, pageToken, email);
+    if (result.threads.length === 0) return result;
+
+    const enriched = await mapWithConcurrency(
+      result.threads,
+      TRIAGE_ENRICHMENT_CONCURRENCY,
+      async (thread) => {
+        try {
+          const messages = await withGmailConcurrency(() =>
+            withRetry(() => getThread(mcpUserId, thread.id, 'metadata', email)),
+          );
+          if (messages.length === 0) return thread;
+
+          const first = messages[0]!;
+          const last = messages[messages.length - 1]!;
+
+          return {
+            ...thread,
+            subject: first.headers.subject,
+            from: last.headers.from,
+            date: last.headers.date,
+            messageCount: messages.length,
+          };
+        } catch {
+          return thread;
+        }
+      },
+    );
+
+    return { threads: enriched, nextPageToken: result.nextPageToken };
   }
 
   /**
@@ -1472,6 +1524,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     batchSearchMessages: limited(batchSearchMessages),
     getMessage: limited(getMessage),
     listThreads: limited(listThreads),
+    listThreadsEnriched,
     getThread: limited(getThread),
     getAttachmentMetadata: limited(getAttachmentMetadata),
     getThreadIdsForMessages: limited(getThreadIdsForMessages),
