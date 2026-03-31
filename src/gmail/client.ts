@@ -56,6 +56,10 @@ export interface SearchResultMessage {
   id: string;
   threadId: string;
   snippet?: string;
+  subject?: string;
+  from?: string;
+  date?: string;
+  messageCount?: number;
 }
 
 export interface SearchResult {
@@ -370,7 +374,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
 
   /**
    * Search messages using Gmail query syntax.
-   * Returns thread IDs + snippets from a single threads.list call -- no fan-out.
+   * Uses listThreadsEnriched to include subject/from/date per result.
    */
   async function searchMessages(
     mcpUserId: string,
@@ -379,13 +383,20 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     pageToken?: string,
     email?: string
   ): Promise<SearchResult> {
-    const result = await listThreads(mcpUserId, query, maxResults, pageToken, email);
+    const result = await listThreadsEnriched(mcpUserId, query, maxResults, pageToken, email);
     return {
-      messages: result.threads.map((thread) => ({
-        id: thread.id,
-        threadId: thread.id,
-        snippet: thread.snippet,
-      })),
+      messages: result.threads.map((thread) => {
+        const enriched = thread as Record<string, unknown>;
+        return {
+          id: thread.id,
+          threadId: thread.id,
+          snippet: thread.snippet,
+          subject: typeof enriched.subject === 'string' ? enriched.subject : undefined,
+          from: typeof enriched.from === 'string' ? enriched.from : undefined,
+          date: typeof enriched.date === 'string' ? enriched.date : undefined,
+          messageCount: typeof enriched.messageCount === 'number' ? enriched.messageCount : undefined,
+        };
+      }),
       nextPageToken: result.nextPageToken,
     };
   }
