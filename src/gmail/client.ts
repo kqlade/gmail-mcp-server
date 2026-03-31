@@ -386,7 +386,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     const result = await listThreadsEnriched(mcpUserId, query, maxResults, pageToken, email);
     return {
       messages: result.threads.map((thread) => {
-        const enriched = thread as Record<string, unknown>;
+        const enriched = thread as unknown as Record<string, unknown>;
         return {
           id: thread.id,
           threadId: thread.id,
