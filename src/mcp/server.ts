@@ -17,20 +17,15 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { Config } from '../config.js';
+import { MCP_USER_ID, type Config } from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import { createGmailClientFactory } from '../gmail/client.js';
+import { createStartToken } from '../auth/bearer.js';
 import { NotAuthorizedError, GmailApiError, InsufficientScopeError } from '../utils/errors.js';
 
 export interface McpServerDependencies {
   config: Config;
   tokenStore: TokenStore;
-}
-
-// Helper to extract MCP user ID from auth info
-function getMcpUserId(extra: { authInfo?: unknown }): string {
-  const authInfo = extra.authInfo as { sub?: string } | undefined;
-  return authInfo?.sub ?? 'anonymous';
 }
 
 // Reusable email schema for selecting which Gmail account to use
@@ -118,8 +113,11 @@ function formatError(error: unknown): {
     code = -32001; // NOT_AUTHORIZED
     message = error.message;
   } else if (error instanceof GmailApiError) {
-    code = error.httpStatus === 429 ? -32000 : -32000; // RATE_LIMITED or GMAIL_API_ERROR
-    message = error.message;
+    code = -32000; // GMAIL_API_ERROR / RATE_LIMITED
+    message = error.httpStatus === 429 ? `Rate limited by Gmail API: ${error.message}` : error.message;
+    if (typeof error.httpStatus === 'number') {
+      data = { ...data, httpStatus: error.httpStatus };
+    }
   } else if (error instanceof Error) {
     message = error.message;
   }
@@ -132,15 +130,13 @@ function formatError(error: unknown): {
 }
 
 export interface McpServerInstance {
-  server: McpServer;
-  transport: StreamableHTTPServerTransport;
   handleRequest: (req: IncomingMessage, res: ServerResponse, body?: unknown) => Promise<void>;
 }
 
 export async function createMcpServer(deps: McpServerDependencies): Promise<McpServerInstance> {
   const { config, tokenStore } = deps;
 
-  // Create Gmail client factory
+  // Create Gmail client factory (shared across requests; holds the client cache)
   const gmailClient = createGmailClientFactory({
     tokenStore,
     encryptionKey: config.tokenEncryptionKey,
@@ -148,7 +144,10 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     googleClientSecret: config.googleClientSecret,
   });
 
-  // Create MCP server with identity
+  // Builds a fresh McpServer with all tools registered. In stateless mode a
+  // server+transport pair must NOT be shared across concurrent requests
+  // (responses cross-wire and hang), so this runs once per request.
+  function buildServer(): McpServer {
   const server = new McpServer(
     {
       name: 'gmail-mcp',
@@ -161,19 +160,14 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     }
   );
 
-  // Create Streamable HTTP transport (stateless mode for now)
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // Stateless mode
-  });
-
   // Register gmail.status tool
   server.registerTool(
     'gmail.status',
     {
       description: 'Returns whether the current user has Gmail connected',
     },
-    async (extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async () => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const accounts = await tokenStore.listAccounts(mcpUserId);
@@ -227,20 +221,22 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         scopes: z.array(z.enum(['gmail.readonly', 'gmail.labels', 'gmail.modify', 'gmail.compose'])).optional(),
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
       const scopes = args?.scopes ?? ['gmail.readonly'];
 
-      // Build authorization URL with MCP user ID
+      // Build a short-lived signed authorization URL. /oauth/start rejects
+      // requests without a valid signature, so only links minted here work.
+      const { exp, sig } = createStartToken(config.mcpAuthToken);
       const authUrl = new URL('/oauth/start', config.baseUrl);
       authUrl.searchParams.set('scopes', scopes.join(','));
-      authUrl.searchParams.set('mcp_user_id', mcpUserId);
+      authUrl.searchParams.set('exp', exp);
+      authUrl.searchParams.set('sig', sig);
 
       return {
         content: [
           {
             type: 'text' as const,
-            text: `To connect your Gmail account, please open the following URL in your browser:\n\n${authUrl.toString()}\n\nAfter authorizing, return here and try your Gmail operation again.`,
+            text: `To connect your Gmail account, please open the following URL in your browser (link valid for 10 minutes):\n\n${authUrl.toString()}\n\nAfter authorizing, return here and try your Gmail operation again.`,
           },
         ],
       };
@@ -270,8 +266,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
       const hasQueries = Array.isArray(args.queries) && args.queries.length > 0;
 
       try {
@@ -334,8 +330,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const message = await gmailClient.getMessage(
@@ -368,8 +364,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const builtQuery = buildSearchQuery(args as StructuredSearchParams) || undefined;
@@ -398,8 +394,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const messages = await gmailClient.getThread(
@@ -426,8 +422,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const attachment = await gmailClient.getAttachmentMetadata(
@@ -480,8 +476,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const builtQuery = buildSearchQuery({
@@ -540,8 +536,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
       const results: Array<{ action: OrganizeAction; ok: boolean; result?: unknown; error?: string }> = [];
 
       for (const item of args.actions) {
@@ -626,8 +622,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const result = await gmailClient.getLabelInfo(mcpUserId, args.labelId, args.email);
@@ -647,8 +643,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const result = await gmailClient.listLabels(mcpUserId, args?.email);
@@ -669,8 +665,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const result = await gmailClient.createLabel(mcpUserId, args.name, args.email);
@@ -697,8 +693,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const result = await gmailClient.sendMessage(mcpUserId, args.to, args.subject, args.body, {
@@ -746,8 +742,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: emailSchema,
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
       const composeOpts = { cc: args.cc, bcc: args.bcc, isHtml: args.isHtml, replyToMessageId: args.replyToMessageId };
 
       try {
@@ -804,8 +800,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     {
       description: 'List all connected Gmail accounts for the current user',
     },
-    async (extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async () => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         const accounts = await gmailClient.listAccounts(mcpUserId);
@@ -841,8 +837,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: z.string().email().describe('Email address of the account to set as default'),
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         await gmailClient.setDefaultAccount(mcpUserId, args.email);
@@ -867,8 +863,8 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         email: z.string().email().describe('Email address of the account to remove'),
       },
     },
-    async (args, extra) => {
-      const mcpUserId = getMcpUserId(extra);
+    async (args) => {
+      const mcpUserId = MCP_USER_ID;
 
       try {
         // Check if this is the last account
@@ -899,17 +895,38 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     }
   );
 
-  // Connect server to transport
-  await server.connect(transport);
+  return server;
+  }
 
-  // Return handler for HTTP requests
+  // Per-request server + transport, mirroring the SDK's stateless example.
   const handleRequest = async (req: IncomingMessage, res: ServerResponse, body?: unknown) => {
-    await transport.handleRequest(req, res, body);
+    const server = buildServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // Stateless mode
+    });
+
+    res.on('close', () => {
+      void transport.close();
+      void server.close();
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } catch (error) {
+      console.error('Error handling MCP request:', error);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: null,
+          })
+        );
+      }
+    }
   };
 
-  return {
-    server,
-    transport,
-    handleRequest,
-  };
+  return { handleRequest };
 }

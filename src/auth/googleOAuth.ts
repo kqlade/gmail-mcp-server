@@ -12,7 +12,7 @@ import { google } from 'googleapis';
 import { CodeChallengeMethod } from 'google-auth-library';
 import { randomBytes, createHash } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
-import type { Config } from '../config.js';
+import { MCP_USER_ID, type Config } from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import { encrypt } from '../utils/crypto.js';
 
@@ -86,7 +86,6 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
   ): Promise<void> {
     const query = request.query as {
       scopes?: string;
-      mcp_user_id?: string;
     };
 
     // Parse requested scopes (comma-separated)
@@ -106,8 +105,8 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
       return;
     }
 
-    // Get MCP user ID from query or generate placeholder
-    const mcpUserId = query.mcp_user_id ?? 'anonymous';
+    // Single-operator deployment: all accounts belong to the fixed identity.
+    const mcpUserId = MCP_USER_ID;
 
     // Generate state token (256-bit random)
     const state = randomBytes(32).toString('base64url');

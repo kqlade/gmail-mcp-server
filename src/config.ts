@@ -4,6 +4,10 @@ import { z } from 'zod';
 // Load .env file
 loadEnv();
 
+// Single-operator deployment: transport-level auth (static bearer token)
+// gates access, and all connected Gmail accounts live under this one identity.
+export const MCP_USER_ID = 'primary';
+
 const configSchema = z.object({
   // Server
   port: z.coerce.number().int().positive().default(3000),
@@ -16,7 +20,7 @@ const configSchema = z.object({
 
   // Security
   tokenEncryptionKey: z.string().min(32, 'TOKEN_ENCRYPTION_KEY must be at least 32 characters'),
-  jwtSecret: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+  mcpAuthToken: z.string().min(24, 'MCP_AUTH_TOKEN must be at least 24 characters'),
 
   // Database
   dbUrl: z.string().default('./data/gmail-mcp.db'),
@@ -37,7 +41,7 @@ function loadConfig(): Config {
     googleClientSecret: process.env['GOOGLE_CLIENT_SECRET'],
     oauthRedirectUri: process.env['OAUTH_REDIRECT_URI'],
     tokenEncryptionKey: process.env['TOKEN_ENCRYPTION_KEY'],
-    jwtSecret: process.env['JWT_SECRET'],
+    mcpAuthToken: process.env['MCP_AUTH_TOKEN'],
     dbUrl: process.env['DB_URL'],
     allowedOrigins: process.env['ALLOWED_ORIGINS'],
   };

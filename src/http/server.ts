@@ -1,10 +1,9 @@
 import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { randomBytes } from 'node:crypto';
 import type { Config } from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import type { McpServerInstance } from '../mcp/server.js';
-import { createMcpOAuth } from '../auth/mcpOAuth.js';
 import { createGoogleOAuth } from '../auth/googleOAuth.js';
+import { checkBearerToken, checkStartToken } from '../auth/bearer.js';
 
 export interface HttpServerDependencies {
   config: Config;
@@ -15,8 +14,6 @@ export interface HttpServerDependencies {
 export async function createHttpServer(deps: HttpServerDependencies): Promise<FastifyInstance> {
   const { config, tokenStore, mcpServer } = deps;
 
-  // Create OAuth handlers
-  const mcpOAuth = createMcpOAuth({ config });
   const googleOAuth = createGoogleOAuth({ config, tokenStore });
 
   const server = Fastify({
@@ -30,20 +27,6 @@ export async function createHttpServer(deps: HttpServerDependencies): Promise<Fa
     try {
       const json = JSON.parse(body as string);
       done(null, json);
-    } catch (err) {
-      done(err as Error, undefined);
-    }
-  });
-
-  // Form-urlencoded parser (required for OAuth token endpoint)
-  server.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
-    try {
-      const params = new URLSearchParams(body as string);
-      const result: Record<string, string> = {};
-      for (const [key, value] of params) {
-        result[key] = value;
-      }
-      done(null, result);
     } catch (err) {
       done(err as Error, undefined);
     }
@@ -81,69 +64,52 @@ export async function createHttpServer(deps: HttpServerDependencies): Promise<Fa
     }
   });
 
-  // MCP Streamable HTTP endpoint
-  server.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
-    const req = request.raw;
-    const res = reply.raw;
-    await mcpServer.handleRequest(req, res, request.body);
-    reply.hijack();
+  // MCP Streamable HTTP endpoint (stateless; bearer-token protected)
+  server.post(
+    '/mcp',
+    {
+      preHandler: async (request, reply) => {
+        if (!checkBearerToken(request.headers.authorization, config.mcpAuthToken)) {
+          reply.status(401).header('WWW-Authenticate', 'Bearer').send({
+            jsonrpc: '2.0',
+            error: { code: -32001, message: 'Unauthorized' },
+            id: null,
+          });
+        }
+      },
+    },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const req = request.raw;
+      const res = reply.raw;
+      await mcpServer.handleRequest(req, res, request.body);
+      reply.hijack();
+    }
+  );
+
+  // Stateless transport: no SSE stream to resume, so GET is not supported
+  server.get('/mcp', async (_request: FastifyRequest, reply: FastifyReply) => {
+    reply.status(405).send({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method not allowed' },
+      id: null,
+    });
   });
 
-  server.get('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
-    const req = request.raw;
-    const res = reply.raw;
-    await mcpServer.handleRequest(req, res);
-    reply.hijack();
+  // Google OAuth endpoints. /oauth/start is opened in a browser (no bearer
+  // header possible), so it requires a short-lived HMAC start token that only
+  // the authenticated gmail.authorize tool can mint.
+  server.get('/oauth/start', async (request: FastifyRequest, reply: FastifyReply) => {
+    const query = request.query as { exp?: string; sig?: string };
+    if (!checkStartToken(query.exp, query.sig, config.mcpAuthToken)) {
+      reply.status(401).send({
+        error: 'unauthorized',
+        error_description: 'Missing or expired authorization link. Run gmail.authorize to get a fresh link.',
+      });
+      return;
+    }
+    return googleOAuth.startHandler(request, reply);
   });
-
-  // MCP OAuth endpoints
-  server.get('/oauth/authorize', mcpOAuth.authorizeEndpointHandler);
-  server.post('/oauth/token', mcpOAuth.tokenEndpointHandler);
-
-  // Dynamic Client Registration (RFC 7591)
-  server.post('/oauth/register', async (request: FastifyRequest, reply: FastifyReply) => {
-    const body = request.body as {
-      client_name?: string;
-      redirect_uris?: string[];
-    } | null;
-
-    // Generate client credentials
-    const clientId = randomBytes(16).toString('hex');
-    const clientSecret = randomBytes(32).toString('hex');
-
-    reply.status(201);
-    return {
-      client_id: clientId,
-      client_secret: clientSecret,
-      client_name: body?.client_name ?? 'MCP Client',
-      redirect_uris: body?.redirect_uris ?? [],
-      token_endpoint_auth_method: 'client_secret_post',
-    };
-  });
-
-  // Google OAuth endpoints
-  server.get('/oauth/start', googleOAuth.startHandler);
   server.get('/oauth/callback', googleOAuth.callbackHandler);
-
-  // Well-known endpoints for MCP OAuth discovery
-  server.get('/.well-known/oauth-protected-resource', async () => {
-    return {
-      resource: config.baseUrl,
-      authorization_servers: [config.baseUrl],
-    };
-  });
-
-  server.get('/.well-known/oauth-authorization-server', async () => {
-    return {
-      issuer: config.baseUrl,
-      authorization_endpoint: `${config.baseUrl}/oauth/authorize`,
-      token_endpoint: `${config.baseUrl}/oauth/token`,
-      registration_endpoint: `${config.baseUrl}/oauth/register`,
-      response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
-      code_challenge_methods_supported: ['S256'],
-    };
-  });
 
   return server;
 }

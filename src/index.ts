@@ -36,18 +36,7 @@ async function main() {
   let mcpServer;
   try {
     mcpServer = await createMcpServer({ config, tokenStore });
-    console.log('MCP server created with 23 tools:');
-    console.log('  - gmail.authorize, gmail.status');
-    console.log('  - gmail.searchMessages, gmail.getMessage');
-    console.log('  - gmail.listThreads, gmail.getThread');
-    console.log('  - gmail.getAttachmentMetadata');
-    console.log('  - gmail.archiveMessages, gmail.unarchiveMessages');
-    console.log('  - gmail.markAsRead, gmail.markAsUnread');
-    console.log('  - gmail.starMessages, gmail.unstarMessages');
-    console.log('  - gmail.getLabelInfo, gmail.listLabels');
-    console.log('  - gmail.addLabels, gmail.removeLabels, gmail.createLabel');
-    console.log('  - gmail.createDraft, gmail.listDrafts, gmail.getDraft');
-    console.log('  - gmail.updateDraft, gmail.deleteDraft');
+    console.log('MCP server ready (per-request stateless transport, bearer-token auth)');
   } catch (error) {
     console.error('Failed to create MCP server:', error);
     await tokenStore.close();
@@ -94,8 +83,7 @@ async function main() {
     await httpServer.listen({ port: config.port, host: '0.0.0.0' });
     console.log(`\nGmail MCP Server running at ${config.baseUrl}`);
     console.log(`  Health check: ${config.baseUrl}/healthz`);
-    console.log(`  MCP endpoint: ${config.baseUrl}/mcp`);
-    console.log(`  OAuth discovery: ${config.baseUrl}/.well-known/oauth-protected-resource`);
+    console.log(`  MCP endpoint: ${config.baseUrl}/mcp (bearer-token auth)`);
   } catch (error) {
     console.error('Failed to start server:', error);
     await tokenStore.close();

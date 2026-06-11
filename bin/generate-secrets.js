@@ -40,11 +40,11 @@ function prompt(question) {
 
 // Generate secrets
 const TOKEN_ENCRYPTION_KEY = crypto.randomBytes(32).toString('base64');
-const JWT_SECRET = crypto.randomBytes(48).toString('base64');
+const MCP_AUTH_TOKEN = crypto.randomBytes(32).toString('base64url');
 
 log('\nGenerated secrets:\n');
 log(`${colors.cyan}TOKEN_ENCRYPTION_KEY${colors.reset}=${TOKEN_ENCRYPTION_KEY}`);
-log(`${colors.cyan}JWT_SECRET${colors.reset}=${JWT_SECRET}`);
+log(`${colors.cyan}MCP_AUTH_TOKEN${colors.reset}=${MCP_AUTH_TOKEN}`);
 log('');
 
 async function main() {
@@ -55,12 +55,12 @@ async function main() {
       let content = fs.readFileSync(envPath, 'utf-8');
 
       // Check if secrets already exist
-      if (content.includes('TOKEN_ENCRYPTION_KEY=') || content.includes('JWT_SECRET=')) {
+      if (content.includes('TOKEN_ENCRYPTION_KEY=') || content.includes('MCP_AUTH_TOKEN=')) {
         const overwrite = await prompt('Secrets already exist in .env. Overwrite? (y/N) ');
         if (overwrite === 'y' || overwrite === 'yes') {
           // Replace existing values
           content = content.replace(/^TOKEN_ENCRYPTION_KEY=.*$/m, `TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}`);
-          content = content.replace(/^JWT_SECRET=.*$/m, `JWT_SECRET=${JWT_SECRET}`);
+          content = content.replace(/^MCP_AUTH_TOKEN=.*$/m, `MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}`);
           fs.writeFileSync(envPath, content);
           log(`${colors.green}Updated secrets in .env${colors.reset}`);
         } else {
@@ -68,7 +68,7 @@ async function main() {
         }
       } else {
         // Append new secrets
-        const addition = `\n# Generated secrets\nTOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}\nJWT_SECRET=${JWT_SECRET}\n`;
+        const addition = `\n# Generated secrets\nTOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}\nMCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}\n`;
         fs.appendFileSync(envPath, addition);
         log(`${colors.green}Added secrets to .env${colors.reset}`);
       }
@@ -82,7 +82,7 @@ async function main() {
 
       // Replace placeholder values
       content = content.replace(/^TOKEN_ENCRYPTION_KEY=.*$/m, `TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}`);
-      content = content.replace(/^JWT_SECRET=.*$/m, `JWT_SECRET=${JWT_SECRET}`);
+      content = content.replace(/^MCP_AUTH_TOKEN=.*$/m, `MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}`);
 
       fs.writeFileSync(envPath, content);
       log(`${colors.green}Created .env with secrets.${colors.reset}`);

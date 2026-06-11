@@ -9,6 +9,7 @@
  */
 
 import { google, gmail_v1 } from 'googleapis';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { TokenStore, GmailCredentials, AccountInfo } from '../store/interface.js';
 import { encrypt, decrypt } from '../utils/crypto.js';
 import { NotAuthorizedError, GmailApiError, InsufficientScopeError } from '../utils/errors.js';
@@ -81,6 +82,8 @@ export interface ThreadListItem {
   from?: string;
   date?: string;
   messageCount?: number;
+  /** Real message ID of the latest message in the thread (from enrichment). */
+  latestMessageId?: string;
 }
 
 export interface ThreadResult {
@@ -163,17 +166,41 @@ const MAX_CONCURRENT_GMAIL_CALLS = 5;
 let activeGmailCalls = 0;
 const waitQueue: Array<() => void> = [];
 
-async function withGmailConcurrency<T>(fn: () => Promise<T>): Promise<T> {
-  if (activeGmailCalls >= MAX_CONCURRENT_GMAIL_CALLS) {
-    await new Promise<void>((resolve) => waitQueue.push(resolve));
+// Tracks whether the current async context already holds a semaphore slot.
+// Composite operations (e.g. searchMessages -> listThreadsEnriched ->
+// getThread) would otherwise acquire nested slots and deadlock the pool once
+// all slots are held by outer calls waiting on inner ones.
+const gmailSlotContext = new AsyncLocalStorage<{ held: boolean }>();
+
+function acquireGmailSlot(): Promise<void> {
+  if (activeGmailCalls < MAX_CONCURRENT_GMAIL_CALLS) {
+    activeGmailCalls++;
+    return Promise.resolve();
   }
-  activeGmailCalls++;
-  try {
-    return await fn();
-  } finally {
+  return new Promise<void>((resolve) => waitQueue.push(resolve));
+}
+
+function releaseGmailSlot(): void {
+  const next = waitQueue.shift();
+  if (next) {
+    // Hand the slot directly to the next waiter; active count is unchanged,
+    // so late arrivals can't barge past the queue.
+    next();
+  } else {
     activeGmailCalls--;
-    const next = waitQueue.shift();
-    if (next) next();
+  }
+}
+
+async function withGmailConcurrency<T>(fn: () => Promise<T>): Promise<T> {
+  if (gmailSlotContext.getStore()?.held) {
+    // Re-entrant call within an operation that already holds a slot.
+    return fn();
+  }
+  await acquireGmailSlot();
+  try {
+    return await gmailSlotContext.run({ held: true }, fn);
+  } finally {
+    releaseGmailSlot();
   }
 }
 
@@ -185,10 +212,36 @@ const MAX_GMAIL_RETRIES = 2;
 const RETRY_BASE_MS = 500;
 const MAX_CONCURRENT_BATCH_SEARCHES = 2;
 
+/**
+ * Extract the numeric HTTP status from an error, handling both our own
+ * GmailApiError and raw gaxios errors (which carry the status on
+ * `error.status` / `error.response.status`; `error.code` is a string like
+ * 'ECONNRESET' in gaxios v6, numeric only in legacy googleapis errors).
+ */
+function getHttpStatus(error: unknown): number | undefined {
+  if (error instanceof GmailApiError) {
+    return typeof error.httpStatus === 'number' ? error.httpStatus : undefined;
+  }
+  const e = error as { status?: unknown; code?: unknown; response?: { status?: unknown } };
+  if (typeof e.status === 'number') return e.status;
+  if (typeof e.response?.status === 'number') return e.response.status;
+  if (typeof e.code === 'number') return e.code;
+  return undefined;
+}
+
 function isTransientGmailError(error: unknown): boolean {
+  if (error instanceof NotAuthorizedError || error instanceof InsufficientScopeError) {
+    return false;
+  }
+
+  const status = getHttpStatus(error);
+  if (status !== undefined) {
+    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+  }
+
   if (!(error instanceof Error)) return false;
   const msg = error.message.toLowerCase();
-  if (
+  return (
     msg.includes('unexpected end of json') ||
     msg.includes('unterminated string in json') ||
     msg.includes('econnreset') ||
@@ -199,14 +252,7 @@ function isTransientGmailError(error: unknown): boolean {
     msg.includes('fetch failed') ||
     msg.includes('socket hang up') ||
     msg.includes('aborted')
-  ) {
-    return true;
-  }
-  const status = (error as { code?: number }).code;
-  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
-    return true;
-  }
-  return false;
+  );
 }
 
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -388,7 +434,9 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       messages: result.threads.map((thread) => {
         const enriched = thread as unknown as Record<string, unknown>;
         return {
-          id: thread.id,
+          // Use the real message ID from enrichment so callers can pass it to
+          // getMessage. Fall back to the thread ID only if enrichment failed.
+          id: typeof enriched.latestMessageId === 'string' ? enriched.latestMessageId : thread.id,
           threadId: thread.id,
           snippet: thread.snippet,
           subject: typeof enriched.subject === 'string' ? enriched.subject : undefined,
@@ -582,6 +630,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
             from: last.headers.from,
             date: last.headers.date,
             messageCount: messages.length,
+            latestMessageId: last.id,
           };
         } catch {
           return thread;
@@ -653,11 +702,12 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
         id: attachmentId,
       });
 
-      // Get message to find attachment details
+      // Get message to find attachment details. Must be format=full:
+      // metadata format omits the body parts that carry attachment info.
       const message = await gmail.users.messages.get({
         userId: 'me',
         id: messageId,
-        format: 'metadata',
+        format: 'full',
       });
 
       const attachments = extractAttachments(message.data.payload);
@@ -1529,6 +1579,16 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     return (...args: TArgs) => withGmailConcurrency(() => withRetry(() => fn(...args)));
   }
 
+  // Concurrency limiter only — NO retry. For non-idempotent operations where
+  // an ambiguous network failure (e.g. socket hang up after Gmail accepted the
+  // request) would duplicate the side effect: double-send an email or create
+  // duplicate drafts.
+  function limitedNoRetry<TArgs extends unknown[], TResult>(
+    fn: (...args: TArgs) => Promise<TResult>
+  ): (...args: TArgs) => Promise<TResult> {
+    return (...args: TArgs) => withGmailConcurrency(() => fn(...args));
+  }
+
   return {
     getValidCredentials,
     searchMessages: limited(searchMessages),
@@ -1556,14 +1616,14 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     addLabels: limited(addLabels),
     removeLabels: limited(removeLabels),
     createLabel: limited(createLabel),
-    // Send methods
-    sendMessage: limited(sendMessage),
+    // Send methods (no retry — duplicate-send risk on ambiguous failures)
+    sendMessage: limitedNoRetry(sendMessage),
     // Trash methods
     trashMessages: limited(trashMessages),
     untrashMessages: limited(untrashMessages),
-    // Draft methods
-    sendDraft: limited(sendDraft),
-    createDraft: limited(createDraft),
+    // Draft methods (send/create are not idempotent — no retry)
+    sendDraft: limitedNoRetry(sendDraft),
+    createDraft: limitedNoRetry(createDraft),
     listDrafts: limited(listDrafts),
     getDraft: limited(getDraft),
     updateDraft: limited(updateDraft),
@@ -1683,11 +1743,12 @@ function wrapGmailError(error: unknown): GmailApiError {
     throw error;
   }
 
-  const gmailError = error as { code?: number; message?: string };
-  const statusCode = gmailError.code ?? 500;
+  const gmailError = error as { message?: string };
   const message = gmailError.message ?? 'Gmail API error';
 
-  return new GmailApiError(message, statusCode);
+  // Numeric HTTP status when present (gaxios `.status`); undefined for
+  // network-level failures so retry logic falls back to message sniffing.
+  return new GmailApiError(message, getHttpStatus(error));
 }
 
 export type GmailClient = ReturnType<typeof createGmailClientFactory>;
