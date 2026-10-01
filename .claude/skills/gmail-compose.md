@@ -20,18 +20,18 @@ Help draft a new email or reply to an existing thread.
 1. Use `gmail_status` to verify authentication
 2. Ask user for: recipient, subject, and key points to cover
 3. Draft the email body based on user's input
-4. Use `gmail_createDraft` to save the draft
+4. Use `gmail.manageDraft({ action: "create", ... })` on the write connection
 5. Provide the draft for review
 
 ## Steps for Reply
 
 1. Use `gmail_status` to verify authentication
 2. Use `gmail_searchMessages` to find the email to reply to
-3. Use `gmail_getMessage` (format: "full") to get the thread context
+3. Use `gmail_getMessage` (format: "full") to get the thread context and opaque `replyContext`
 4. Understand the conversation and what's being asked
 5. Ask user what they want to say in response
 6. Draft a contextual reply
-7. Use `gmail_createDraft` with `replyToMessageId` to create threaded reply
+7. Use `gmail.manageDraft({ action: "create", replyContext, ... })` on the write connection
 8. Provide the draft for review
 
 ## Steps for Follow-up
@@ -40,7 +40,7 @@ Help draft a new email or reply to an existing thread.
 2. Use `gmail_searchMessages` to find recent emails with that person
 3. Use `gmail_getThread` to get full conversation context
 4. Draft a follow-up based on the last exchange
-5. Use `gmail_createDraft` with `replyToMessageId` to thread it
+5. Use the latest message's `replyContext` with `gmail.manageDraft({ action: "create", ... })`
 6. Provide the draft for review
 
 ## Output Format
@@ -57,13 +57,13 @@ Subject: {subject}
 Draft saved. You can:
 • Edit and send from Gmail
 • Ask me to revise it
-• Delete with gmail_deleteDraft({ draftId: "{id}" })
+• Delete with gmail.manageDraft({ action: "delete", draftId: "{id}" })
 ```
 
 ## Notes
 
 - Always create a draft, never send directly (no send capability)
-- For replies, use `replyToMessageId` to ensure proper threading
+- For replies, pass the encrypted `replyContext` from the read result; never substitute a message ID
 - Match the tone of the conversation (formal/casual)
 - Keep emails concise unless user asks for detailed content
 - If replying, reference specific points from the original email

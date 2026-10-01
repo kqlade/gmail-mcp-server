@@ -12,10 +12,10 @@ Provide a comprehensive profile of the inbox for orientation or periodic review.
 1. Use `gmail_status` to verify authentication
 2. Use `gmail_listAccounts` to identify which account is being explored
 3. Use `gmail_getLabelInfo` for: INBOX, UNREAD, STARRED, SENT, DRAFT, SPAM, TRASH
-4. Use `gmail_listLabels` to get all labels with counts (runs in parallel internally)
-5. Use `gmail_batchSearchMessages` to run all time-range queries in parallel:
+4. Use `gmail_listLabels` to get label names; use `gmail_getLabelInfo` only for counts on the specific labels you report
+5. Use `gmail.searchMessages` with `queries` to run all time-range queries in parallel:
    ```
-   gmail_batchSearchMessages({
+   gmail.searchMessages({
      queries: [
        { query: "in:inbox newer_than:1d", maxResults: 50 },
        { query: "in:inbox newer_than:7d", maxResults: 50 },
@@ -79,6 +79,6 @@ Custom:
 
 ## Performance
 
-- `gmail_batchSearchMessages` runs all 3 time-range queries in parallel (much faster than sequential)
-- `gmail_listLabels` fetches all label details in parallel internally
+- `gmail.searchMessages` runs all `queries` in parallel
+- `gmail_listLabels` returns names and IDs only; targeted `gmail_getLabelInfo` calls return counts
 - This skill should complete in a few seconds even for large inboxes

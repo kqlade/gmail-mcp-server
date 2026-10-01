@@ -1,7 +1,7 @@
 ---
 name: gmail-explore
 description: Analyze inbox patterns and provide comprehensive overview. Use when user asks to analyze inbox, see email patterns, get inbox overview, or understand their email habits.
-tools: mcp__gmail-mcp__gmail_status, mcp__gmail-mcp__gmail_listAccounts, mcp__gmail-mcp__gmail_searchMessages, mcp__gmail-mcp__gmail_getLabelInfo, mcp__gmail-mcp__gmail_listLabels
+tools: mcp__gmail-read__gmail_status, mcp__gmail-read__gmail_listAccounts, mcp__gmail-read__gmail_searchMessages, mcp__gmail-read__gmail_getLabelInfo, mcp__gmail-read__gmail_listLabels
 model: inherit
 ---
 

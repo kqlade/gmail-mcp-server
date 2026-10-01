@@ -12,6 +12,16 @@ import { google, gmail_v1 } from 'googleapis';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { TokenStore, GmailCredentials, AccountInfo } from '../store/interface.js';
 import { encrypt, decrypt } from '../utils/crypto.js';
+import {
+  createReplyContext,
+  deriveReplyContextKey,
+  openReplyContext,
+} from '../auth/replyContext.js';
+import {
+  createDraftContext,
+  deriveDraftContextKey,
+  openDraftContext,
+} from '../auth/draftContext.js';
 import { NotAuthorizedError, GmailApiError, InsufficientScopeError } from '../utils/errors.js';
 
 export interface GmailClientDependencies {
@@ -42,6 +52,8 @@ export interface MessageMetadata {
     date?: string;
   };
   attachments: AttachmentMetadata[];
+  /** Opaque metadata for a write-only credential to preserve reply threading. */
+  replyContext?: string;
 }
 
 export interface MessageFull extends MessageMetadata {
@@ -132,10 +144,14 @@ export interface DraftContent {
   snippet: string;
   subject?: string;
   to?: string;
+  cc?: string;
+  bcc?: string;
   body?: {
     text?: string;
     html?: string;
   };
+  /** Opaque metadata that lets a write credential update without losing headers. */
+  draftContext?: string;
 }
 
 export interface DraftListResult {
@@ -304,6 +320,8 @@ async function mapWithConcurrency<T, R>(
  */
 export function createGmailClientFactory(deps: GmailClientDependencies) {
   const { tokenStore, encryptionKey, googleClientId, googleClientSecret, pinnedAccountFor } = deps;
+  const replyContextKey = deriveReplyContextKey(encryptionKey);
+  const draftContextKey = deriveDraftContextKey(encryptionKey);
 
   /**
    * Get or refresh credentials for the caller's account.
@@ -442,6 +460,72 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     return client;
   }
 
+  function replyContextFor(
+    mcpUserId: string,
+    message: gmail_v1.Schema$Message
+  ): string | undefined {
+    const messageId = message.id;
+    const threadId = message.threadId;
+    const headers = message.payload?.headers ?? [];
+    const inReplyTo = headers.find(
+      (header) => header.name?.toLowerCase() === 'message-id'
+    )?.value;
+    const references = headers.find(
+      (header) => header.name?.toLowerCase() === 'references'
+    )?.value;
+    if (!messageId || !threadId || !inReplyTo) return undefined;
+    try {
+      return createReplyContext(
+        {
+          mcpUserId,
+          messageId,
+          threadId,
+          inReplyTo,
+          ...(references ? { references } : {}),
+        },
+        replyContextKey
+      );
+    } catch {
+      // Malformed provider headers must not make the message itself unreadable.
+      return undefined;
+    }
+  }
+
+  function draftContextFor(
+    mcpUserId: string,
+    draftId: string,
+    message: gmail_v1.Schema$Message
+  ): string | undefined {
+    const headers = message.payload?.headers ?? [];
+    const header = (name: string): string | undefined =>
+      headers.find((item) => item.name?.toLowerCase() === name)?.value ?? undefined;
+    const body = extractBody(message.payload);
+    try {
+      return createDraftContext(
+        {
+          mcpUserId,
+          draftId,
+          messageId: message.id ?? '',
+          ...(message.threadId ? { threadId: message.threadId } : {}),
+          ...(header('to') ? { to: header('to') } : {}),
+          ...(header('cc') ? { cc: header('cc') } : {}),
+          ...(header('bcc') ? { bcc: header('bcc') } : {}),
+          ...(header('subject') ? { subject: header('subject') } : {}),
+          ...(header('in-reply-to') ? { inReplyTo: header('in-reply-to') } : {}),
+          ...(header('references') ? { references: header('references') } : {}),
+          // Gmail commonly represents rich drafts as multipart/alternative
+          // with both generated text and HTML parts. Preserve rich content
+          // whenever an HTML part exists, not only for a top-level text/html.
+          isHtml: message.payload?.mimeType === 'text/html' || !!body.html,
+        },
+        draftContextKey
+      );
+    } catch {
+      // Malformed provider headers must not make the draft itself unreadable.
+      return undefined;
+    }
+  }
+
   /**
    * Search messages using Gmail query syntax.
    * Uses listThreadsEnriched to include subject/from/date per result.
@@ -524,12 +608,13 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
         userId: 'me',
         id: messageId,
         format: apiFormat,
-        metadataHeaders: ['From', 'To', 'Subject', 'Date'],
+        metadataHeaders: ['From', 'To', 'Subject', 'Date', 'Message-ID', 'References'],
       });
 
       const message = response.data;
       const headers = extractHeaders(message.payload?.headers ?? []);
       const attachments = extractAttachments(message.payload);
+      const replyContext = replyContextFor(mcpUserId, message);
 
       const metadata: MessageMetadata = {
         id: message.id!,
@@ -537,6 +622,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
         snippet: message.snippet ?? '',
         headers,
         attachments,
+        ...(replyContext ? { replyContext } : {}),
       };
 
       if (format === 'metadata') {
@@ -636,7 +722,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       async (thread) => {
         try {
           const messages = await withGmailConcurrency(() =>
-            withRetry(() => getThread(mcpUserId, thread.id, 'metadata')),
+            withRetry(() => getThread(mcpUserId, thread.id, 'metadata', false)),
           );
           if (messages.length === 0) return thread;
 
@@ -666,7 +752,8 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
   async function getThread(
     mcpUserId: string,
     threadId: string,
-    format: 'metadata' | 'full' = 'metadata'
+    format: 'metadata' | 'full' = 'metadata',
+    includeReplyContext = true
   ): Promise<Array<MessageMetadata | MessageFull>> {
     const gmail = await getGmailClient(mcpUserId);
 
@@ -675,12 +762,15 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
         userId: 'me',
         id: threadId,
         format: format === 'full' ? 'full' : 'metadata',
-        metadataHeaders: ['From', 'To', 'Subject', 'Date'],
+        metadataHeaders: ['From', 'To', 'Subject', 'Date', 'Message-ID', 'References'],
       });
 
       return (response.data.messages ?? []).map(message => {
         const headers = extractHeaders(message.payload?.headers ?? []);
         const attachments = extractAttachments(message.payload);
+        const replyContext = includeReplyContext
+          ? replyContextFor(mcpUserId, message)
+          : undefined;
 
         const metadata: MessageMetadata = {
           id: message.id!,
@@ -688,6 +778,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
           snippet: message.snippet ?? '',
           headers,
           attachments,
+          ...(replyContext ? { replyContext } : {}),
         };
 
         if (format === 'full') {
@@ -741,47 +832,6 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     } catch (error: unknown) {
       throw wrapGmailError(error);
     }
-  }
-
-  /**
-   * Get threadIds for a list of messageIds.
-   * Used by archive operations to convert message-level to thread-level operations.
-   * Uses parallel fetching for improved performance.
-   */
-  async function getThreadIdsForMessages(
-    mcpUserId: string,
-    messageIds: string[]
-  ): Promise<string[]> {
-    const gmail = await getGmailClient(mcpUserId);
-
-    const results = await mapWithConcurrency(messageIds, MAX_CONCURRENT_GMAIL_CALLS, async (messageId) => {
-        try {
-          const response = await gmail.users.messages.get({
-            userId: 'me',
-            id: messageId,
-            format: 'minimal',
-            fields: 'threadId',
-          });
-          return response.data.threadId ?? null;
-        } catch (error) {
-          // If message not found, skip it (it may have been deleted)
-          const gmailError = error as { code?: number };
-          if (gmailError.code !== 404) {
-            throw wrapGmailError(error);
-          }
-          return null;
-        }
-      });
-
-    // Collect unique threadIds, filtering out nulls
-    const threadIds = new Set<string>();
-    for (const threadId of results) {
-      if (threadId) {
-        threadIds.add(threadId);
-      }
-    }
-
-    return Array.from(threadIds);
   }
 
   /**
@@ -919,7 +969,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
    *
    * IMPORTANT: Gmail's inbox is thread-based. A thread remains in the inbox if ANY
    * message in that thread has the INBOX label. For reliable archiving, prefer using
-   * threadIds or use the MCP tool with archiveEntireThread=true (default).
+   * threadIds from the read surface when the whole conversation should move.
    */
   async function archiveMessages(
     mcpUserId: string,
@@ -932,8 +982,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
   /**
    * Unarchive messages and/or threads (add INBOX label).
    *
-   * For consistency, prefer using threadIds or use the MCP tool with
-   * archiveEntireThread=true (default) to restore entire conversations.
+   * Pass threadIds from the read surface to restore entire conversations.
    */
   async function unarchiveMessages(
     mcpUserId: string,
@@ -1087,8 +1136,8 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
 
   /**
    * Create a new draft email.
-   * When replyToMessageId is provided, the draft will be threaded as a reply
-   * with proper In-Reply-To and References headers.
+   * An opaque replyContext from the read surface preserves threading without
+   * any mailbox read on this write path.
    */
   async function createDraft(
     mcpUserId: string,
@@ -1099,7 +1148,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       cc?: string | string[];
       bcc?: string | string[];
       isHtml?: boolean;
-      replyToMessageId?: string;
+      replyContext?: string;
     }
   ): Promise<{ draftId: string; messageId: string }> {
     await checkScope(mcpUserId, GMAIL_COMPOSE_SCOPE);
@@ -1110,34 +1159,13 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     let references = '';
     let threadId: string | undefined;
 
-    if (options?.replyToMessageId) {
-      // Fetch the original message to get threading headers
-      const originalMsg = await gmail.users.messages.get({
-        userId: 'me',
-        id: options.replyToMessageId,
-        format: 'metadata',
-        metadataHeaders: ['Message-ID', 'References'],
-      });
-
-      threadId = originalMsg.data.threadId ?? undefined;
-
-      // Extract Message-ID from original
-      const messageIdHeader = originalMsg.data.payload?.headers?.find(
-        (h) => h.name?.toLowerCase() === 'message-id'
-      );
-      if (messageIdHeader?.value) {
-        inReplyTo = messageIdHeader.value;
-
-        // Build References: existing references + original message-id
-        const referencesHeader = originalMsg.data.payload?.headers?.find(
-          (h) => h.name?.toLowerCase() === 'references'
-        );
-        if (referencesHeader?.value) {
-          references = `${referencesHeader.value} ${inReplyTo}`;
-        } else {
-          references = inReplyTo;
-        }
-      }
+    if (options?.replyContext) {
+      const context = openReplyContext(options.replyContext, mcpUserId, replyContextKey);
+      threadId = context.threadId;
+      inReplyTo = context.inReplyTo;
+      references = context.references
+        ? `${context.references} ${context.inReplyTo}`
+        : context.inReplyTo;
     }
 
     // Build email headers
@@ -1182,7 +1210,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
 
   /**
    * Send an email message directly.
-   * Supports replies via replyToMessageId (preserves threading).
+   * Supports replies via an opaque replyContext from the read surface.
    */
   async function sendMessage(
     mcpUserId: string,
@@ -1193,7 +1221,7 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       cc?: string | string[];
       bcc?: string | string[];
       isHtml?: boolean;
-      replyToMessageId?: string;
+      replyContext?: string;
     }
   ): Promise<{ messageId: string; threadId: string }> {
     await checkScope(mcpUserId, GMAIL_COMPOSE_SCOPE);
@@ -1203,28 +1231,13 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     let references = '';
     let threadId: string | undefined;
 
-    if (options?.replyToMessageId) {
-      const originalMsg = await gmail.users.messages.get({
-        userId: 'me',
-        id: options.replyToMessageId,
-        format: 'metadata',
-        metadataHeaders: ['Message-ID', 'References'],
-      });
-
-      threadId = originalMsg.data.threadId ?? undefined;
-
-      const messageIdHeader = originalMsg.data.payload?.headers?.find(
-        (h) => h.name?.toLowerCase() === 'message-id'
-      );
-      if (messageIdHeader?.value) {
-        inReplyTo = messageIdHeader.value;
-        const referencesHeader = originalMsg.data.payload?.headers?.find(
-          (h) => h.name?.toLowerCase() === 'references'
-        );
-        references = referencesHeader?.value
-          ? `${referencesHeader.value} ${inReplyTo}`
-          : inReplyTo;
-      }
+    if (options?.replyContext) {
+      const context = openReplyContext(options.replyContext, mcpUserId, replyContextKey);
+      threadId = context.threadId;
+      inReplyTo = context.inReplyTo;
+      references = context.references
+        ? `${context.references} ${context.inReplyTo}`
+        : context.inReplyTo;
     }
 
     const toAddrs = Array.isArray(to) ? to.join(', ') : to;
@@ -1313,14 +1326,20 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
       const headers = message?.payload?.headers ?? [];
       const subjectHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'subject');
       const toHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'to');
+      const ccHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'cc');
+      const bccHeader = headers.find((h: gmail_v1.Schema$MessagePartHeader) => h.name?.toLowerCase() === 'bcc');
+      const id = response.data.id!;
 
       return {
-        id: response.data.id!,
+        id,
         messageId: message?.id ?? '',
         snippet: message?.snippet ?? '',
         subject: subjectHeader?.value ?? undefined,
         to: toHeader?.value ?? undefined,
+        cc: ccHeader?.value ?? undefined,
+        bcc: bccHeader?.value ?? undefined,
         body: extractBody(message?.payload),
+        ...(message ? { draftContext: draftContextFor(mcpUserId, id, message) } : {}),
       };
     } catch (error: unknown) {
       throw wrapGmailError(error);
@@ -1329,71 +1348,60 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
 
   /**
    * Update a draft.
-   * When replyToMessageId is provided, the draft will be threaded as a reply
-   * with proper In-Reply-To and References headers.
+   * An opaque draftContext from the read surface preserves all existing
+   * recipients, content type, and threading without a mailbox read here.
    */
   async function updateDraft(
     mcpUserId: string,
     draftId: string,
-    to: string | string[],
-    subject: string,
+    to: string | string[] | undefined,
+    subject: string | undefined,
     body: string,
-    options?: {
+    options: {
+      draftContext: string;
       cc?: string | string[];
       bcc?: string | string[];
       isHtml?: boolean;
-      replyToMessageId?: string;
+      replyContext?: string;
     }
   ): Promise<{ draftId: string; messageId: string }> {
     await checkScope(mcpUserId, GMAIL_COMPOSE_SCOPE);
     const gmail = await getGmailClient(mcpUserId);
 
-    // Threading headers for replies
-    let inReplyTo = '';
-    let references = '';
-    let threadId: string | undefined;
+    const draftContext = openDraftContext(
+      options.draftContext,
+      mcpUserId,
+      draftId,
+      draftContextKey
+    );
+    let inReplyTo = draftContext.inReplyTo ?? '';
+    let references = draftContext.references ?? '';
+    let threadId = draftContext.threadId;
 
-    if (options?.replyToMessageId) {
-      // Fetch the original message to get threading headers
-      const originalMsg = await gmail.users.messages.get({
-        userId: 'me',
-        id: options.replyToMessageId,
-        format: 'metadata',
-        metadataHeaders: ['Message-ID', 'References'],
-      });
-
-      threadId = originalMsg.data.threadId ?? undefined;
-
-      // Extract Message-ID from original
-      const messageIdHeader = originalMsg.data.payload?.headers?.find(
-        (h) => h.name?.toLowerCase() === 'message-id'
-      );
-      if (messageIdHeader?.value) {
-        inReplyTo = messageIdHeader.value;
-
-        // Build References: existing references + original message-id
-        const referencesHeader = originalMsg.data.payload?.headers?.find(
-          (h) => h.name?.toLowerCase() === 'references'
-        );
-        if (referencesHeader?.value) {
-          references = `${referencesHeader.value} ${inReplyTo}`;
-        } else {
-          references = inReplyTo;
-        }
-      }
+    if (options.replyContext) {
+      const context = openReplyContext(options.replyContext, mcpUserId, replyContextKey);
+      threadId = context.threadId;
+      inReplyTo = context.inReplyTo;
+      references = context.references
+        ? `${context.references} ${context.inReplyTo}`
+        : context.inReplyTo;
     }
 
-    const toAddrs = Array.isArray(to) ? to.join(', ') : to;
-    const ccAddrs = options?.cc ? (Array.isArray(options.cc) ? options.cc.join(', ') : options.cc) : '';
-    const bccAddrs = options?.bcc ? (Array.isArray(options.bcc) ? options.bcc.join(', ') : options.bcc) : '';
-    const contentType = options?.isHtml ? 'text/html' : 'text/plain';
+    const resolvedTo = to ?? draftContext.to ?? '';
+    const resolvedCc = options.cc === undefined ? (draftContext.cc ?? '') : options.cc;
+    const resolvedBcc = options.bcc === undefined ? (draftContext.bcc ?? '') : options.bcc;
+    const resolvedSubject = subject ?? draftContext.subject ?? '';
+    const toAddrs = Array.isArray(resolvedTo) ? resolvedTo.join(', ') : resolvedTo;
+    const ccAddrs = Array.isArray(resolvedCc) ? resolvedCc.join(', ') : resolvedCc;
+    const bccAddrs = Array.isArray(resolvedBcc) ? resolvedBcc.join(', ') : resolvedBcc;
+    const contentType = (options.isHtml ?? draftContext.isHtml) ? 'text/html' : 'text/plain';
 
     let rawEmail = `To: ${toAddrs}\r\n`;
     if (ccAddrs) rawEmail += `Cc: ${ccAddrs}\r\n`;
     if (bccAddrs) rawEmail += `Bcc: ${bccAddrs}\r\n`;
     if (inReplyTo) rawEmail += `In-Reply-To: ${inReplyTo}\r\n`;
     if (references) rawEmail += `References: ${references}\r\n`;
-    rawEmail += `Subject: ${subject}\r\n`;
+    rawEmail += `Subject: ${resolvedSubject}\r\n`;
     rawEmail += `Content-Type: ${contentType}; charset=utf-8\r\n\r\n`;
     rawEmail += body;
 
@@ -1582,7 +1590,6 @@ export function createGmailClientFactory(deps: GmailClientDependencies) {
     listThreadsEnriched,
     getThread: limited(getThread),
     getAttachmentMetadata: limited(getAttachmentMetadata),
-    getThreadIdsForMessages: limited(getThreadIdsForMessages),
     // Modification methods
     checkScope,
     modifyMessage: limited(modifyMessage),

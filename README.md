@@ -4,10 +4,10 @@ An MCP (Model Context Protocol) server that exposes Gmail inbox tools via Stream
 
 ## Features
 
-- **Pinned account** - The server operates on one hardcoded Gmail account; callers can never route to another
+- **Pinned callers** - Each bearer credential operates on one configured Gmail account and cannot route to another
 - **Full Gmail access** - Search messages, read threads, manage labels, archive, star, and compose drafts
 - **Secure token storage** - Refresh tokens encrypted with AES-256-GCM in SQLite
-- **Two-layer OAuth** - MCP-level JWT authentication plus Google OAuth for Gmail
+- **Two-layer auth** - Server-enforced bearer capabilities plus one-time PKCE Google OAuth
 - **Docker ready** - Run with Docker Compose for easy deployment
 
 ## Quick Start
@@ -54,7 +54,9 @@ The server runs on `http://localhost:3000`.
 npm run claude:setup
 ```
 
-This installs the MCP server connection and Gmail skills.
+This reads the scoped tokens from your private `.env`, installs separate
+authenticated `gmail-read` and `gmail-write` connections, and installs the
+Gmail skills. The generated `~/.claude.json` is forced to mode `0600`.
 
 ## Claude Code Integration
 
@@ -131,8 +133,8 @@ Create a `.env` file based on `.env.example`:
 | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret | Yes |
 | `OAUTH_REDIRECT_URI` | OAuth callback URL | Yes |
 | `TOKEN_ENCRYPTION_KEY` | 32-byte base64 key for token encryption | Yes |
-| `MCP_AUTH_TOKENS` | Capability credentials: `id:token[:account[:read\|write\|read+write]]` entries, comma- or newline-separated. Use separate `read` and `write` tokens with the same id/account | One of these |
-| `MCP_AUTH_TOKEN` | Legacy single caller (`primary`); `GMAIL_ACCOUNT` optionally pins its account | One of these |
+| `MCP_AUTH_TOKENS` | Exact `id:token:account:read` or `id:token:account:write` entries, comma- or newline-separated. Use separate random read and write tokens with the same id/account | One of these |
+| `MCP_AUTH_TOKEN` | Legacy all-capability caller (`primary`); requires `GMAIL_ACCOUNT` and should exist only during cutover | One of these |
 | `DB_URL` | SQLite database path (default: `./data/gmail-mcp.db`) | No |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins | No |
 
@@ -153,39 +155,30 @@ Create a `.env` file based on `.env.example`:
 | Tool | Description |
 |------|-------------|
 | `gmail.searchMessages` | Search using Gmail query syntax |
-| `gmail.batchSearchMessages` | Run multiple searches in parallel |
+| `gmail.searchMessages` with `queries` | Run multiple searches in parallel |
 | `gmail.getMessage` | Get a single message by ID |
 | `gmail.listThreads` | List conversation threads |
 | `gmail.getThread` | Get all messages in a thread |
 | `gmail.getAttachmentMetadata` | Get attachment info |
+| `gmail.triageSnapshot` | Fetch bounded inbox signals for triage |
 
 ### Labels
 | Tool | Description |
 |------|-------------|
-| `gmail.listLabels` | List all labels with counts |
+| `gmail.listLabels` | List label IDs, names, and types |
 | `gmail.getLabelInfo` | Get details about a specific label |
 | `gmail.createLabel` | Create a custom label |
-| `gmail.addLabels` | Add labels to messages/threads |
-| `gmail.removeLabels` | Remove labels from messages/threads |
 
 ### Modifications
 | Tool | Description |
 |------|-------------|
-| `gmail.archiveMessages` | Archive messages/threads |
-| `gmail.unarchiveMessages` | Move back to inbox |
-| `gmail.markAsRead` | Mark as read |
-| `gmail.markAsUnread` | Mark as unread |
-| `gmail.starMessages` | Add star |
-| `gmail.unstarMessages` | Remove star |
+| `gmail.organizeMessages` | Archive, mark read/unread, star, trash, or change labels in batches |
+| `gmail.sendMessage` | Send a message; replies consume opaque context from the read surface |
 
 ### Drafts
 | Tool | Description |
 |------|-------------|
-| `gmail.createDraft` | Create a new draft |
-| `gmail.listDrafts` | List all drafts |
-| `gmail.getDraft` | Get draft content |
-| `gmail.updateDraft` | Update an existing draft |
-| `gmail.deleteDraft` | Delete a draft |
+| `gmail.manageDraft` | Read token: `get`/`list`; write token: `create`/`update`/`delete`/`send` |
 
 ## OAuth Scopes
 
@@ -201,20 +194,23 @@ Request only the scopes you need:
 ## Callers
 
 Every request carries a bearer token. `MCP_AUTH_TOKENS` maps it to a caller id
-(a person's handle), a server-enforced `read` or `write` capability, and,
-optionally, the one Google account that caller may connect. Credentials are
+(a person's handle), a server-enforced `read` or `write` capability, and the
+one Google account that caller may connect. Credentials are
 stored per caller, so two people share one deployment without seeing each
 other's mail, and a read token cannot advertise or invoke mutation tools.
 
 - Every tool resolves credentials for the caller's account; there is no
   per-call `email` parameter. Agent callers used to hallucinate addresses and
   burn entire sessions on "account not connected" retry loops.
-- A pinned credential (`id:token:account:read` or `:write`) can only connect that account: the
+- A credential (`id:token:account:read` or `:write`) can only connect that account: the
   OAuth callback rejects any other, so a wrong pick in the account chooser
-  can't create a half-connected state. An unpinned caller operates on
-  whichever account they connected.
-- `gmail.authorize` links are signed with the caller's own token, so a link
-  minted for one person cannot land a grant in another person's row.
+  can't create a half-connected state.
+- `gmail.authorize` creates a one-time PKCE state bound to the exact write
+  credential and requested scopes, then returns Google's URL directly.
+  Removing that credential invalidates an in-flight flow.
+- Write tools never read Gmail to resolve IDs or reply headers. Read results
+  carry encrypted `replyContext` values that the write surface can consume
+  without learning additional mailbox data.
 - `gmail.setDefaultAccount` / `gmail.removeAccount` were removed: switching is
   meaningless and disconnecting would let a confused agent brick email access.
 
@@ -269,10 +265,10 @@ MCP Client → Fastify HTTP (/mcp) → MCP Server → Gmail Client → Google AP
 ```
 
 - **`src/index.ts`** - Entry point
-- **`src/http/server.ts`** - Fastify server with `/mcp`, `/oauth/*`, `/healthz` endpoints
-- **`src/mcp/server.ts`** - MCP server with 26 registered tools
+- **`src/http/server.ts`** - Fastify server with `/mcp`, `/oauth/callback`, `/healthz` endpoints
+- **`src/mcp/server.ts`** - Capability-filtered MCP tools
 - **`src/gmail/client.ts`** - Gmail API wrapper with token refresh
-- **`src/auth/`** - MCP JWT auth and Google OAuth flows
+- **`src/auth/`** - Bearer auth, opaque reply context, and Google OAuth flows
 - **`src/store/sqlite.ts`** - SQLite token store with AES-256-GCM encryption
 
 ## License

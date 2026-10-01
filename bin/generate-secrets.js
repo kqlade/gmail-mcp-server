@@ -24,6 +24,18 @@ function log(msg) {
   console.log(msg);
 }
 
+function upsertEnv(content, name, value) {
+  const pattern = new RegExp(`^${name}=.*$`, 'm');
+  return pattern.test(content)
+    ? content.replace(pattern, `${name}=${value}`)
+    : `${content.replace(/\s*$/, '')}\n${name}=${value}\n`;
+}
+
+function envValue(content, name) {
+  const match = content.match(new RegExp(`^${name}=(.*)$`, 'm'));
+  return match?.[1]?.trim() ?? '';
+}
+
 function prompt(question) {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -40,37 +52,51 @@ function prompt(question) {
 
 // Generate secrets
 const TOKEN_ENCRYPTION_KEY = crypto.randomBytes(32).toString('base64');
-const MCP_AUTH_TOKEN = crypto.randomBytes(32).toString('base64url');
-
-log('\nGenerated secrets:\n');
-log(`${colors.cyan}TOKEN_ENCRYPTION_KEY${colors.reset}=${TOKEN_ENCRYPTION_KEY}`);
-log(`${colors.cyan}MCP_AUTH_TOKEN${colors.reset}=${MCP_AUTH_TOKEN}`);
-log('');
+const MCP_READ_TOKEN = crypto.randomBytes(32).toString('base64url');
+const MCP_WRITE_TOKEN = crypto.randomBytes(32).toString('base64url');
 
 async function main() {
+  const account = (await prompt('Google account email to pin these credentials to: ')).trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(account)) {
+    throw new Error('Enter a valid Google account email address');
+  }
+  const MCP_AUTH_TOKENS =
+    `primary:${MCP_READ_TOKEN}:${account.toLowerCase()}:read,` +
+    `primary:${MCP_WRITE_TOKEN}:${account.toLowerCase()}:write`;
+
+  log('\nGenerated scoped credentials for any missing values. Existing secrets are never rotated; keep .env private.\n');
+
   // Check if .env exists
   if (fs.existsSync(envPath)) {
     const answer = await prompt('Append to existing .env file? (y/N) ');
     if (answer === 'y' || answer === 'yes') {
       let content = fs.readFileSync(envPath, 'utf-8');
 
-      // Check if secrets already exist
-      if (content.includes('TOKEN_ENCRYPTION_KEY=') || content.includes('MCP_AUTH_TOKEN=')) {
-        const overwrite = await prompt('Secrets already exist in .env. Overwrite? (y/N) ');
-        if (overwrite === 'y' || overwrite === 'yes') {
-          // Replace existing values
-          content = content.replace(/^TOKEN_ENCRYPTION_KEY=.*$/m, `TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}`);
-          content = content.replace(/^MCP_AUTH_TOKEN=.*$/m, `MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}`);
-          fs.writeFileSync(envPath, content);
-          log(`${colors.green}Updated secrets in .env${colors.reset}`);
-        } else {
-          log('Skipped.');
+      const existingEncryptionKey = envValue(content, 'TOKEN_ENCRYPTION_KEY');
+      const existingScopedTokens = envValue(content, 'MCP_AUTH_TOKENS');
+      const additions = [];
+
+      // Rotating this key makes every stored OAuth refresh token and opaque
+      // reply context unreadable. This helper only fills a missing key.
+      if (!existingEncryptionKey) {
+        content = upsertEnv(content, 'TOKEN_ENCRYPTION_KEY', TOKEN_ENCRYPTION_KEY);
+        additions.push('TOKEN_ENCRYPTION_KEY');
+      }
+      // Likewise, migration is additive: keep a working legacy MCP_AUTH_TOKEN
+      // until clients have switched and the operator removes it explicitly.
+      if (!existingScopedTokens) {
+        content = upsertEnv(content, 'MCP_AUTH_TOKENS', MCP_AUTH_TOKENS);
+        additions.push('MCP_AUTH_TOKENS');
+      }
+
+      if (additions.length > 0) {
+        fs.writeFileSync(envPath, content);
+        log(`${colors.green}Added missing ${additions.join(' and ')} to .env${colors.reset}`);
+        if (envValue(content, 'MCP_AUTH_TOKEN')) {
+          log(`${colors.yellow}Kept legacy MCP_AUTH_TOKEN for cutover; remove it only after scoped clients are verified.${colors.reset}`);
         }
       } else {
-        // Append new secrets
-        const addition = `\n# Generated secrets\nTOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}\nMCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}\n`;
-        fs.appendFileSync(envPath, addition);
-        log(`${colors.green}Added secrets to .env${colors.reset}`);
+        log('Existing encryption key and scoped credentials were preserved; nothing changed.');
       }
     } else {
       log('Skipped.');
@@ -81,8 +107,8 @@ async function main() {
       let content = fs.readFileSync(envExamplePath, 'utf-8');
 
       // Replace placeholder values
-      content = content.replace(/^TOKEN_ENCRYPTION_KEY=.*$/m, `TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}`);
-      content = content.replace(/^MCP_AUTH_TOKEN=.*$/m, `MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}`);
+      content = upsertEnv(content, 'TOKEN_ENCRYPTION_KEY', TOKEN_ENCRYPTION_KEY);
+      content = upsertEnv(content, 'MCP_AUTH_TOKENS', MCP_AUTH_TOKENS);
 
       fs.writeFileSync(envPath, content);
       log(`${colors.green}Created .env with secrets.${colors.reset}`);

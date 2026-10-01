@@ -1,7 +1,7 @@
 ---
 name: gmail-cleanup
 description: Find emails to archive and clean up inbox. Use when user asks to clean up inbox, declutter, find what can be archived, or reduce inbox size.
-tools: mcp__gmail-mcp__gmail_status, mcp__gmail-mcp__gmail_searchMessages, mcp__gmail-mcp__gmail_getLabelInfo, mcp__gmail-mcp__gmail_archiveMessages
+tools: mcp__gmail-read__gmail_status, mcp__gmail-read__gmail_searchMessages, mcp__gmail-read__gmail_getLabelInfo
 model: inherit
 ---
 

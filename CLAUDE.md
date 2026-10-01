@@ -41,36 +41,37 @@ MCP Client → Fastify HTTP (/mcp) → MCP Server → Gmail Client → Google AP
 
 - **`src/index.ts`** - Entry point; initializes config, token store, MCP server, HTTP server
 - **`src/config.ts`** - Zod-validated environment configuration with lazy initialization
-- **`src/http/server.ts`** - Fastify server exposing `/mcp`, `/oauth/*`, `/healthz`, `/.well-known/*`
-- **`src/mcp/server.ts`** - MCP server with 27 tools registered; validates inputs with Zod schemas
+- **`src/http/server.ts`** - Fastify server exposing `/mcp`, `/oauth/callback`, and `/healthz`
+- **`src/mcp/server.ts`** - Capability-filtered MCP tools with Zod input schemas
 - **`src/gmail/client.ts`** - Gmail API wrapper with token refresh logic (5-min threshold, exponential backoff)
-- **`src/auth/mcpOAuth.ts`** - MCP-level OAuth: JWT issuance, validation, discovery endpoints
+- **`src/auth/bearer.ts`** - Resolves bearer credentials to callers
+- **`src/auth/replyContext.ts`** - Encrypts reply metadata passed from read to write
 - **`src/auth/googleOAuth.ts`** - Google OAuth flow with PKCE support and state management
 - **`src/store/sqlite.ts`** - SQLite token store with composite key `(mcp_user_id, email)` for multi-account; refresh tokens encrypted with AES-256-GCM
 
 ### Authentication Layers
 
-1. **MCP-level**: JWT access tokens (HS256, 1hr lifetime) with `sub` claim as user identity
+1. **MCP-level**: static high-entropy bearer credentials mapped to a caller and capability
 2. **Gmail-level**: Google OAuth tokens stored per MCP user; supports readonly, labels, modify, compose scopes
 
 ### Callers
 
-- A credential is one bearer token plus the identity and capability it unlocks (`Caller` in `src/config.ts`). `MCP_AUTH_TOKENS` holds `id:token[:account[:read|write|read+write]]` entries; use separate read and write entries with the same id/account. The legacy `MCP_AUTH_TOKEN` is all-capability caller `primary`, optionally pinned by `GMAIL_ACCOUNT`.
+- A credential is one bearer token plus the identity and capability it unlocks (`Caller` in `src/config.ts`). `MCP_AUTH_TOKENS` accepts only exact `id:token:account:read` or `id:token:account:write` entries. Use separate read and write entries with the same id/account. The legacy `MCP_AUTH_TOKEN` is all-capability caller `primary` and requires `GMAIL_ACCOUNT`.
 - The token alone selects the `mcpUserId`; nothing in a request body can name another person. `buildServer(caller)` in `src/mcp/server.ts` closes every tool over the caller.
-- A caller with a pinned `account` operates only on that Google account and the OAuth callback rejects any other; an unpinned caller operates on the account they connected (their default row). There is no per-call `email` parameter either way.
-- `gmail.authorize` mints a start link signed with the caller's own token (`caller`, `exp`, `sig`), so `/oauth/start` binds `OAuthState.mcpUserId` to that caller and a link cannot land a grant in someone else's row.
+- Every caller is pinned to one `account`; the OAuth callback rejects any other. There is no per-call `email` parameter.
+- `gmail.authorize` creates one-time PKCE state bound to the exact write credential and requested scopes, then returns Google's URL directly. There is no unauthenticated `/oauth/start` endpoint.
 - Credential resolution happens server-side in `getValidCredentials` (client.ts), with a case-insensitive fallback against the stored address for pinned callers
 - `gmail.listAccounts` is read-only visibility; `gmail.setDefaultAccount` / `gmail.removeAccount` were removed on purpose
 - Database keeps the composite primary key `(mcp_user_id, email)` from the multi-account era
 
-### Tool Categories (27 tools)
+### Tool Categories
 
 - Status/Auth: `gmail.status`, `gmail.authorize`
 - Account Visibility: `gmail.listAccounts` (read-only)
-- Read: `gmail.searchMessages`, `gmail.batchSearchMessages`, `gmail.getMessage`, `gmail.listThreads`, `gmail.getThread`, `gmail.getAttachmentMetadata`
-- Labels: `gmail.getLabelInfo`, `gmail.listLabels`, `gmail.addLabels`, `gmail.removeLabels`, `gmail.createLabel`
-- Modifications: `gmail.archiveMessages`, `gmail.unarchiveMessages`, `gmail.markAsRead`, `gmail.markAsUnread`, `gmail.starMessages`, `gmail.unstarMessages`
-- Drafts: `gmail.createDraft`, `gmail.listDrafts`, `gmail.getDraft`, `gmail.updateDraft`, `gmail.deleteDraft`
+- Read: `gmail.searchMessages` (single or batch), `gmail.getMessage`, `gmail.listThreads`, `gmail.getThread`, `gmail.getAttachmentMetadata`, `gmail.triageSnapshot`
+- Labels: `gmail.getLabelInfo`, `gmail.listLabels`, `gmail.createLabel`
+- Modifications: `gmail.organizeMessages`, `gmail.sendMessage`
+- Drafts: `gmail.manageDraft` (`get`/`list` on read; mutations on write)
 
 ### Error Handling Pattern
 
@@ -81,7 +82,7 @@ Custom error classes in `src/utils/errors.ts` map to MCP JSON-RPC codes:
 
 ### Required Environment Variables
 
-See `.env.example`. Key variables: `PORT`, `BASE_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OAUTH_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`, `JWT_SECRET`
+See `.env.example`. Key variables: `PORT`, `BASE_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OAUTH_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`, `MCP_AUTH_TOKENS`
 
 ### Token Refresh Behavior
 
@@ -97,20 +98,14 @@ Gmail's inbox is **thread-based**. Important implications:
    - `messageIds` - operates on individual messages
    - `threadIds` - operates on all messages in the thread
 
-**Recommendation for archive operations**: Use `threadIds` or rely on the default `archiveEntireThread=true` behavior.
-
-### Archive/Unarchive Parameters
-
-| Tool | Parameter | Default | Behavior |
-|------|-----------|---------|----------|
-| `archiveMessages` | `archiveEntireThread` | `true` | Converts messageIds to threadIds automatically |
-| `unarchiveMessages` | `archiveEntireThread` | `true` | Converts messageIds to threadIds automatically |
-
-Set `archiveEntireThread=false` to archive only specific messages (thread may remain in inbox).
+**Recommendation for archive operations**: pass `threadIds` returned by the
+read surface to `gmail.organizeMessages`. The write surface deliberately does
+not resolve message IDs with a Gmail read. Passing `messageIds` modifies only
+those messages, so the thread may remain in the inbox.
 
 ### Search Results
 
-`searchMessages` returns `threadMessageCount` for each result, indicating how many messages are in that thread. This helps identify multi-message conversations for thread-aware operations.
+`searchMessages` returns `messageCount` for each enriched result, indicating how many messages are in that thread. This helps identify multi-message conversations for thread-aware operations.
 
 ### Claude Code Subagents & Skills
 

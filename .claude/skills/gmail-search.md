@@ -51,10 +51,10 @@ Remind user of common operators if query is simple:
 
 ## Multi-Query Search
 
-If the user wants to search for multiple things at once (e.g., "search for emails from Alice and Bob"), use `gmail_batchSearchMessages` to run queries in parallel:
+If the user wants to search for multiple things at once (e.g., "search for emails from Alice and Bob"), use `gmail.searchMessages` with `queries`:
 
 ```
-gmail_batchSearchMessages({
+gmail.searchMessages({
   queries: [
     { query: "from:alice@example.com", maxResults: 20 },
     { query: "from:bob@example.com", maxResults: 20 }
@@ -70,4 +70,4 @@ This is much faster than running sequential searches.
 - Show snippet for context on what the email is about
 - If no results, suggest query modifications
 - If query is empty, show syntax help
-- For multiple related queries, use `gmail_batchSearchMessages` for parallel execution
+- For multiple related queries, use `gmail.searchMessages` with `queries`

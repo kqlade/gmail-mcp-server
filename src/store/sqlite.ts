@@ -82,11 +82,18 @@ export class SqliteTokenStore implements TokenStore {
       CREATE TABLE IF NOT EXISTS oauth_states (
         state TEXT PRIMARY KEY,
         mcp_user_id TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         scopes TEXT NOT NULL,
         code_verifier TEXT NOT NULL
       )
     `);
+    const oauthStateColumns = this.db.prepare('PRAGMA table_info(oauth_states)').all() as Array<{ name: string }>;
+    if (!oauthStateColumns.some((column) => column.name === 'credential_id')) {
+      // Existing in-flight links predate exact-credential binding and must
+      // fail closed; the empty value cannot match a credential fingerprint.
+      this.db.exec(`ALTER TABLE oauth_states ADD COLUMN credential_id TEXT NOT NULL DEFAULT ''`);
+    }
 
     // Create index for cleanup
     this.db.exec(`
@@ -323,13 +330,14 @@ export class SqliteTokenStore implements TokenStore {
 
   async saveOAuthState(state: OAuthState): Promise<void> {
     const stmt = this.db.prepare(`
-      INSERT INTO oauth_states (state, mcp_user_id, expires_at, scopes, code_verifier)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO oauth_states (state, mcp_user_id, credential_id, expires_at, scopes, code_verifier)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
       state.state,
       state.mcpUserId,
+      state.credentialId,
       state.expiresAt.toISOString(),
       JSON.stringify(state.scopes),
       state.codeVerifier
@@ -348,6 +356,7 @@ export class SqliteTokenStore implements TokenStore {
       const row = selectStmt.get(state, now) as {
         state: string;
         mcp_user_id: string;
+        credential_id: string;
         expires_at: string;
         scopes: string;
         code_verifier: string;
@@ -366,6 +375,7 @@ export class SqliteTokenStore implements TokenStore {
       return {
         state: row.state,
         mcpUserId: row.mcp_user_id,
+        credentialId: row.credential_id,
         expiresAt: new Date(row.expires_at),
         scopes: JSON.parse(row.scopes) as string[],
         codeVerifier: row.code_verifier,

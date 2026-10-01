@@ -27,7 +27,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { callerById, callerCan, type Caller, type Config } from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import { createGmailClientFactory } from '../gmail/client.js';
-import { createStartToken } from '../auth/bearer.js';
+import { createGoogleOAuth } from '../auth/googleOAuth.js';
 import { NotAuthorizedError, GmailApiError, InsufficientScopeError } from '../utils/errors.js';
 
 export interface McpServerDependencies {
@@ -137,8 +137,112 @@ export interface McpServerInstance {
   handleRequest: (req: IncomingMessage, res: ServerResponse, body: unknown, caller: Caller) => Promise<void>;
 }
 
+function containsKey(value: unknown, key: string): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((item) => containsKey(item, key));
+  const record = value as Record<string, unknown>;
+  return Object.prototype.hasOwnProperty.call(record, key) ||
+    Object.values(record).some((item) => containsKey(item, key));
+}
+
+function retiredArgumentError(body: unknown): { id: unknown; message: string } | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const request = body as {
+    id?: unknown;
+    method?: unknown;
+    params?: { arguments?: unknown };
+  };
+  if (request.method !== 'tools/call') return null;
+  const args = request.params?.arguments;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  if (containsKey(args, 'email')) {
+    return {
+      id: request.id ?? null,
+      message: 'The email argument is retired. This bearer credential is pinned to one mailbox; remove email and retry.',
+    };
+  }
+  if (containsKey(args, 'replyToMessageId')) {
+    return {
+      id: request.id ?? null,
+      message: 'replyToMessageId is retired because write credentials cannot read mailbox metadata. Get the message with the read credential and pass its opaque replyContext.',
+    };
+  }
+  if (containsKey(args, 'archiveEntireThread')) {
+    return {
+      id: request.id ?? null,
+      message: 'archiveEntireThread is retired because write credentials cannot resolve message IDs by reading Gmail. Pass threadIds from the read result, or pass messageIds to modify only those messages.',
+    };
+  }
+  return null;
+}
+
+function isJsonRpcNotification(body: unknown): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const request = body as {
+    id?: unknown;
+    jsonrpc?: unknown;
+    method?: unknown;
+    params?: unknown;
+  };
+  const paramsValid =
+    request.params === undefined ||
+    (request.params !== null && typeof request.params === 'object');
+  return (
+    !Object.prototype.hasOwnProperty.call(request, 'id') &&
+    request.jsonrpc === '2.0' &&
+    typeof request.method === 'string' &&
+    paramsValid
+  );
+}
+
+function unsupportedBatchResponses(body: unknown[]): Array<Record<string, unknown>> {
+  const responses: Array<Record<string, unknown>> = [];
+  for (const item of body) {
+    const retired = retiredArgumentError(item);
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      responses.push({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32600, message: 'Invalid JSON-RPC request' },
+      });
+      continue;
+    }
+    const request = item as {
+      id?: unknown;
+      jsonrpc?: unknown;
+      method?: unknown;
+      params?: unknown;
+    };
+    const paramsValid =
+      request.params === undefined ||
+      (request.params !== null && typeof request.params === 'object');
+    const structurallyValid =
+      request.jsonrpc === '2.0' &&
+      typeof request.method === 'string' &&
+      paramsValid;
+    // Only a structurally valid notification suppresses its response.
+    if (isJsonRpcNotification(request)) {
+      continue;
+    }
+    responses.push({
+      jsonrpc: '2.0',
+      id: request.id ?? null,
+      error: !structurallyValid
+        ? { code: -32600, message: 'Invalid JSON-RPC request' }
+        : retired
+        ? { code: -32602, message: retired.message }
+        : {
+            code: -32600,
+            message: 'JSON-RPC batch requests are not supported; send each request separately',
+          },
+    });
+  }
+  return responses;
+}
+
 export async function createMcpServer(deps: McpServerDependencies): Promise<McpServerInstance> {
   const { config, tokenStore } = deps;
+  const googleOAuth = createGoogleOAuth({ config, tokenStore });
 
   // Create Gmail client factory (shared across requests; holds the client cache)
   const gmailClient = createGmailClientFactory({
@@ -221,22 +325,17 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
     async (args) => {
       const scopes = args?.scopes ?? ['gmail.readonly'];
 
-      // Build a short-lived signed authorization URL. /oauth/start rejects
-      // requests without a valid signature, so only links minted here work.
-      const { caller: callerId, exp, sig } = createStartToken(caller);
-      const authUrl = new URL('/oauth/start', config.baseUrl);
-      authUrl.searchParams.set('scopes', scopes.join(','));
-      authUrl.searchParams.set('caller', callerId);
-      authUrl.searchParams.set('exp', exp);
-      authUrl.searchParams.set('sig', sig);
+      // Create one-time PKCE state from this authenticated write request and
+      // return Google's URL directly. There is no browser-accessible start hop.
+      const authUrl = await googleOAuth.createAuthorizationUrl(caller, scopes);
 
       return {
         content: [
           {
             type: 'text' as const,
             text: caller.account
-              ? `To connect Gmail, open the following URL in your browser and sign in as ${caller.account} — other accounts are rejected (link valid for 10 minutes):\n\n${authUrl.toString()}\n\nAfter authorizing, return here and try your Gmail operation again.`
-              : `To connect Gmail, open the following URL in your browser and sign in with the Google account this compartment should use (link valid for 10 minutes):\n\n${authUrl.toString()}\n\nAfter authorizing, return here and try your Gmail operation again.`,
+              ? `To connect Gmail, open the following URL in your browser and sign in as ${caller.account} — other accounts are rejected (link valid for 10 minutes):\n\n${authUrl}\n\nAfter authorizing, return here and try your Gmail operation again.`
+              : `To connect Gmail, open the following URL in your browser and sign in with the Google account this compartment should use (link valid for 10 minutes):\n\n${authUrl}\n\nAfter authorizing, return here and try your Gmail operation again.`,
           },
         ],
       };
@@ -505,15 +604,13 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
       description:
         'Apply one or more organize actions to messages/threads in a single call. ' +
         'Supported actions: archive, unarchive, mark_read, mark_unread, star, unstar, trash, untrash, add_labels, remove_labels. ' +
-        'Each action item specifies its own messageIds/threadIds. ' +
-        'For archive/unarchive, set archiveEntireThread (default true) to auto-expand messageIds to their parent threads.',
+        'Each action item specifies its own messageIds/threadIds. Pass threadIds from a read result to archive or unarchive a whole conversation.',
       inputSchema: {
         actions: z.array(z.object({
           action: z.enum(ORGANIZE_ACTIONS).describe('The organize operation to perform'),
           messageIds: z.array(z.string()).optional().describe('Message IDs to act on'),
           threadIds: z.array(z.string()).optional().describe('Thread IDs to act on'),
           labelIds: z.array(z.string()).optional().describe('Label IDs (required for add_labels/remove_labels)'),
-          archiveEntireThread: z.boolean().optional().describe('For archive/unarchive: expand messageIds to full threads (default true)'),
         })).min(1).describe('Array of organize actions to apply'),
       },
     },
@@ -527,14 +624,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         }
 
         try {
-          let { messageIds, threadIds } = item;
-          const expandThread = item.archiveEntireThread ?? true;
-
-          if ((item.action === 'archive' || item.action === 'unarchive') && expandThread && messageIds?.length) {
-            const expanded = await gmailClient.getThreadIdsForMessages(mcpUserId, messageIds);
-            threadIds = [...new Set([...(threadIds ?? []), ...expanded])];
-            messageIds = undefined;
-          }
+          const { messageIds, threadIds } = item;
 
           let result: unknown;
           switch (item.action) {
@@ -653,7 +743,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
   if (canWrite) server.registerTool(
     'gmail.sendMessage',
     {
-      description: 'Send an email message. For replies, provide replyToMessageId to preserve threading. Requires gmail.compose scope.',
+      description: 'Send an email message. For replies, pass the opaque replyContext returned by gmail.getMessage on the read surface. Requires gmail.compose scope.',
       inputSchema: {
         to: z.union([z.string(), z.array(z.string())]).describe('Recipient email address(es)'),
         subject: z.string().describe('Email subject'),
@@ -661,7 +751,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         cc: z.union([z.string(), z.array(z.string())]).optional().describe('CC recipient(s)'),
         bcc: z.union([z.string(), z.array(z.string())]).optional().describe('BCC recipient(s)'),
         isHtml: z.boolean().optional().describe('Whether body is HTML (default: false, plain text)'),
-        replyToMessageId: z.string().optional().describe('Message ID to reply to. Preserves threading with proper In-Reply-To and References headers.'),
+        replyContext: z.string().optional().describe('Opaque context returned by gmail.getMessage. Preserves threading without giving this write surface mailbox-read access.'),
       },
     },
     async (args) => {
@@ -671,7 +761,7 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
           cc: args.cc,
           bcc: args.bcc,
           isHtml: args.isHtml,
-          replyToMessageId: args.replyToMessageId,
+          replyContext: args.replyContext,
         });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
       } catch (error) {
@@ -683,17 +773,24 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
   // ============== DRAFT LIFECYCLE TOOL ==============
 
   const DRAFT_ACTIONS = ['create', 'get', 'update', 'delete', 'send', 'list'] as const;
+  const READ_ONLY_DRAFT_ACTIONS = ['get', 'list'] as const;
   const WRITE_ONLY_DRAFT_ACTIONS = ['create', 'update', 'delete', 'send'] as const;
-  const availableDraftActions = canRead ? DRAFT_ACTIONS : WRITE_ONLY_DRAFT_ACTIONS;
+  const availableDraftActions = canRead && canWrite
+    ? DRAFT_ACTIONS
+    : canRead
+      ? READ_ONLY_DRAFT_ACTIONS
+      : WRITE_ONLY_DRAFT_ACTIONS;
 
   const recipientSchema = z.union([z.string(), z.array(z.string())]);
 
-  if (canWrite) server.registerTool(
+  if (canRead || canWrite) server.registerTool(
     'gmail.manageDraft',
     {
-      description: canRead
+      description: canRead && canWrite
         ? 'Manage draft emails. Actions: create, get, update, delete, send, or list.'
-        : 'Mutate draft emails. Actions: create, update, delete, or send. Reading and listing drafts require a read-capability token.',
+        : canRead
+          ? 'Read draft emails. Actions: get or list. Mutations require a write-capability token.'
+          : 'Mutate draft emails. Actions: create, update, delete, or send. Reading and listing drafts require a read-capability token.',
       inputSchema: {
         action: z.enum(availableDraftActions).describe('Draft operation to perform'),
         draftId: z.string().optional().describe('Draft ID (required for get/update/delete/send)'),
@@ -703,13 +800,14 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
         cc: recipientSchema.optional().describe('CC recipient(s)'),
         bcc: recipientSchema.optional().describe('BCC recipient(s)'),
         isHtml: z.boolean().optional().describe('Whether body is HTML (default: false)'),
-        replyToMessageId: z.string().optional().describe('Message ID to reply to (preserves threading)'),
+        draftContext: z.string().optional().describe('Required for update: opaque context from gmail.getDraft that preserves omitted recipients, content type, and threading'),
+        replyContext: z.string().optional().describe('Opaque context returned by gmail.getMessage (preserves threading without a mailbox read on this surface)'),
         maxResults: z.number().int().min(1).max(100).optional().describe('Max results for list (default 20)'),
         pageToken: z.string().optional().describe('Pagination token for list'),
       },
     },
     async (args) => {
-      const composeOpts = { cc: args.cc, bcc: args.bcc, isHtml: args.isHtml, replyToMessageId: args.replyToMessageId };
+      const composeOpts = { cc: args.cc, bcc: args.bcc, isHtml: args.isHtml, replyContext: args.replyContext };
 
       try {
         let result: unknown;
@@ -728,10 +826,17 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
             result = await gmailClient.getDraft(mcpUserId, args.draftId);
             break;
           case 'update':
-            if (!args.draftId || !args.to || !args.subject || !args.body) {
-              return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'draftId, to, subject, and body are required for action=update', code: -32602 }) }], isError: true as const };
+            if (!args.draftId || !args.body || !args.draftContext) {
+              return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'draftId, body, and draftContext from gmail.getDraft are required for action=update', code: -32602 }) }], isError: true as const };
             }
-            result = await gmailClient.updateDraft(mcpUserId, args.draftId, args.to, args.subject, args.body, composeOpts);
+            result = await gmailClient.updateDraft(
+              mcpUserId,
+              args.draftId,
+              args.to,
+              args.subject,
+              args.body,
+              { ...composeOpts, draftContext: args.draftContext }
+            );
             break;
           case 'delete':
             if (!args.draftId) {
@@ -798,6 +903,41 @@ export async function createMcpServer(deps: McpServerDependencies): Promise<McpS
 
   // Per-request server + transport, mirroring the SDK's stateless example.
   const handleRequest = async (req: IncomingMessage, res: ServerResponse, body: unknown, caller: Caller) => {
+    if (Array.isArray(body)) {
+      if (body.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'Invalid JSON-RPC request: an empty batch is not allowed' },
+        }));
+        return;
+      }
+      const responses = unsupportedBatchResponses(body);
+      if (responses.length === 0) {
+        res.writeHead(202);
+        res.end();
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(responses));
+      }
+      return;
+    }
+    const retired = retiredArgumentError(body);
+    if (retired) {
+      if (isJsonRpcNotification(body)) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        jsonrpc: '2.0',
+        id: retired.id,
+        error: { code: -32602, message: retired.message },
+      }));
+      return;
+    }
     const server = buildServer(caller);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // Stateless mode

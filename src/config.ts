@@ -1,5 +1,5 @@
 import { config as loadEnv } from 'dotenv';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 // Load .env file
@@ -34,14 +34,14 @@ export const ALL_CAPABILITIES: Capability[] = ['read', 'write'];
 export const LEGACY_CALLER_ID = 'primary';
 const MIN_TOKEN_LENGTH = 24;
 const CALLER_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const EMAIL_ADDRESS = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const TOKEN_PLACEHOLDER = /^(?:generate|replace|change|your)(?:-|_)/i;
 
 /**
- * Parse MCP_AUTH_TOKENS: entries separated by commas or newlines, each
- * `id:token`, `id:token:account`, or `id:token:account:capabilities`. Use an
- * empty account slot for an unpinned scoped token (`id:token::read`).
- * Capabilities are `read`, `write`, or `read+write`; omitted means both for a
- * backward-compatible migration. The same id may appear once per disjoint
- * capability so one mailbox can have separate read and write credentials.
+ * Parse MCP_AUTH_TOKENS: entries separated by commas or newlines, each exactly
+ * `id:token:account:read` or `id:token:account:write`. The same id may appear
+ * once per capability so one pinned mailbox can have separate read and write
+ * credentials. Anything less explicit fails closed.
  */
 export function parseCallers(raw: string | undefined): Caller[] {
   const callers: Caller[] = [];
@@ -50,10 +50,11 @@ export function parseCallers(raw: string | undefined): Caller[] {
   const capabilitiesById = new Map<string, Set<Capability>>();
   const entries = (raw ?? '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   for (const [entryIndex, entry] of entries.entries()) {
-    const [id, token, account, capabilityText, ...rest] = entry.split(':').map((s) => s.trim());
-    if (!id || !token || rest.length > 0) {
+    const fields = entry.split(':').map((s) => s.trim());
+    const [id, token, account, capabilityText] = fields;
+    if (fields.length !== 4 || !id || !token || !account || !capabilityText) {
       throw new Error(
-        `MCP_AUTH_TOKENS entry must be id:token[:account[:read|write|read+write]] ` +
+        `MCP_AUTH_TOKENS entry must be id:token:account:read or id:token:account:write ` +
         `(invalid entry ${entryIndex + 1})`
       );
     }
@@ -64,25 +65,19 @@ export function parseCallers(raw: string | undefined): Caller[] {
     if (token.length < MIN_TOKEN_LENGTH) {
       throw new Error(`MCP_AUTH_TOKENS token for ${normalizedId} must be at least ${MIN_TOKEN_LENGTH} characters`);
     }
+    if (TOKEN_PLACEHOLDER.test(token)) {
+      throw new Error(`MCP_AUTH_TOKENS token for ${normalizedId} is a placeholder; generate a random credential`);
+    }
     if (seenTokens.has(token)) throw new Error(`MCP_AUTH_TOKENS reuses a token (${normalizedId})`);
     seenTokens.add(token);
-    const capabilities = capabilityText
-      ? capabilityText.split('+').map((value) => value.trim()).filter(Boolean)
-      : [...ALL_CAPABILITIES];
-    if (
-      capabilities.length === 0 ||
-      capabilities.some((value) => value !== 'read' && value !== 'write')
-    ) {
-      throw new Error(`MCP_AUTH_TOKENS capabilities for ${normalizedId} must be read, write, or read+write`);
+    if (capabilityText !== 'read' && capabilityText !== 'write') {
+      throw new Error(`MCP_AUTH_TOKENS capability for ${normalizedId} must be exactly read or write`);
     }
-    const uniqueCapabilities = [...new Set(capabilities)] as Capability[];
-    if (uniqueCapabilities.length !== capabilities.length) {
-      throw new Error(`MCP_AUTH_TOKENS repeats a capability for ${normalizedId}`);
-    }
+    const capability = capabilityText as Capability;
 
-    const normalizedAccount = account ? account.toLowerCase() : undefined;
-    if (account) {
-      if (!account.includes('@')) throw new Error(`MCP_AUTH_TOKENS account for ${normalizedId} is not an email address`);
+    const normalizedAccount = account.toLowerCase();
+    if (!EMAIL_ADDRESS.test(normalizedAccount)) {
+      throw new Error(`MCP_AUTH_TOKENS account for ${normalizedId} is not an email address`);
     }
     if (accountById.has(normalizedId) && accountById.get(normalizedId) !== normalizedAccount) {
       throw new Error(`MCP_AUTH_TOKENS gives ${normalizedId} conflicting pinned accounts`);
@@ -90,21 +85,20 @@ export function parseCallers(raw: string | undefined): Caller[] {
     accountById.set(normalizedId, normalizedAccount);
 
     const priorCapabilities = capabilitiesById.get(normalizedId) ?? new Set<Capability>();
-    const overlap = uniqueCapabilities.filter((capability) => priorCapabilities.has(capability));
-    if (overlap.length > 0) {
+    if (priorCapabilities.has(capability)) {
       throw new Error(
-        `MCP_AUTH_TOKENS lists ${normalizedId} capability ${overlap.join('+')} more than once`
+        `MCP_AUTH_TOKENS lists ${normalizedId} capability ${capability} more than once`
       );
     }
-    uniqueCapabilities.forEach((capability) => priorCapabilities.add(capability));
+    priorCapabilities.add(capability);
     capabilitiesById.set(normalizedId, priorCapabilities);
 
     const caller: Caller = {
       id: normalizedId,
       token,
-      capabilities: uniqueCapabilities,
+      account: normalizedAccount,
+      capabilities: [capability],
     };
-    if (normalizedAccount) caller.account = normalizedAccount;
     callers.push(caller);
   }
   return callers;
@@ -123,8 +117,8 @@ const configSchema = z.object({
   // Security
   tokenEncryptionKey: z.string().min(32, 'TOKEN_ENCRYPTION_KEY must be at least 32 characters'),
   // Who may call: MCP_AUTH_TOKENS (per person) and/or the legacy single
-  // MCP_AUTH_TOKEN (caller "primary", optionally pinned by GMAIL_ACCOUNT).
-  callers: z.array(z.custom<Caller>()).min(1, 'Set MCP_AUTH_TOKENS (id:token[:account], comma-separated) or MCP_AUTH_TOKEN'),
+  // MCP_AUTH_TOKEN (caller "primary", pinned by required GMAIL_ACCOUNT).
+  callers: z.array(z.custom<Caller>()).min(1, 'Set MCP_AUTH_TOKENS (id:token:account:read|write, comma-separated) or MCP_AUTH_TOKEN with GMAIL_ACCOUNT'),
 
   // Database
   dbUrl: z.string().default('./data/gmail-mcp.db'),
@@ -145,12 +139,21 @@ export function callersFromEnv(env: NodeJS.ProcessEnv = process.env): Caller[] {
     if (legacyToken.length < MIN_TOKEN_LENGTH) {
       throw new Error(`MCP_AUTH_TOKEN must be at least ${MIN_TOKEN_LENGTH} characters`);
     }
+    if (TOKEN_PLACEHOLDER.test(legacyToken)) {
+      throw new Error('MCP_AUTH_TOKEN is a placeholder; generate a random credential');
+    }
     if (callers.some((c) => c.token === legacyToken)) {
       throw new Error('MCP_AUTH_TOKEN reuses a token from MCP_AUTH_TOKENS');
     }
     const primaryCallers = callers.filter((c) => c.id === LEGACY_CALLER_ID);
     const configuredPin = (env['GMAIL_ACCOUNT'] ?? '').trim().toLowerCase() || undefined;
     const capabilityPin = primaryCallers[0]?.account;
+    if (
+      (configuredPin && !EMAIL_ADDRESS.test(configuredPin)) ||
+      (!configuredPin && !capabilityPin)
+    ) {
+      throw new Error('Legacy MCP_AUTH_TOKEN requires GMAIL_ACCOUNT to pin the only mailbox it may access');
+    }
     if (
       primaryCallers.length > 0 &&
       configuredPin !== undefined &&
@@ -168,8 +171,7 @@ export function callersFromEnv(env: NodeJS.ProcessEnv = process.env): Caller[] {
     // Temporary overlap makes a zero-downtime cutover possible: add scoped
     // `primary` credentials, switch clients, then remove MCP_AUTH_TOKEN. All
     // credentials resolve the existing `primary` database rows.
-    const pinned = capabilityPin ?? configuredPin;
-    if (pinned) legacy.account = pinned;
+    legacy.account = capabilityPin ?? configuredPin;
     callers.push(legacy);
   }
   return callers;
@@ -191,6 +193,17 @@ export function callerForToken(callers: Caller[], token: string): Caller | null 
 
 export function callerById(callers: Caller[], id: string): Caller | null {
   return callers.find((c) => c.id === id) ?? null;
+}
+
+/** Stable, non-secret identifier for one exact bearer credential. */
+export function callerCredentialId(caller: Caller): string {
+  return createHash('sha256').update(caller.token).digest('base64url');
+}
+
+export function callerByCredentialId(callers: Caller[], id: string, credentialId: string): Caller | null {
+  return callers.find(
+    (caller) => caller.id === id && callerCredentialId(caller) === credentialId
+  ) ?? null;
 }
 
 export function callerCan(caller: Caller, capability: Capability): boolean {

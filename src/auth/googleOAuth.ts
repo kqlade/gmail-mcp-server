@@ -3,7 +3,7 @@
  *
  * This module handles:
  * - Google OAuth2 client setup
- * - /oauth/start endpoint (generate state, redirect to Google)
+ * - Authenticated authorization-URL creation
  * - /oauth/callback endpoint (exchange code, store credentials)
  * - Scope validation and mapping
  */
@@ -12,7 +12,13 @@ import { google } from 'googleapis';
 import { CodeChallengeMethod } from 'google-auth-library';
 import { randomBytes, createHash } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
-import { callerById, type Caller, type Config } from '../config.js';
+import {
+  callerByCredentialId,
+  callerCan,
+  callerCredentialId,
+  type Caller,
+  type Config,
+} from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import { encrypt } from '../utils/crypto.js';
 
@@ -27,6 +33,20 @@ export const GMAIL_SCOPES = {
 export type GmailScope = keyof typeof GMAIL_SCOPES;
 
 const VALID_SCOPES = new Set<string>(Object.keys(GMAIL_SCOPES));
+
+export function grantedScopesExactlyMatch(
+  requestedScopes: string[],
+  grantedScopeText: string | undefined
+): boolean {
+  const expected = new Set(
+    requestedScopes.map((scope) => GMAIL_SCOPES[scope as GmailScope])
+  );
+  const granted = new Set((grantedScopeText ?? '').split(/\s+/).filter(Boolean));
+  return (
+    granted.size === expected.size &&
+    [...expected].every((scope) => granted.has(scope))
+  );
+}
 
 export interface GoogleOAuthDependencies {
   config: Config;
@@ -86,34 +106,24 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
   }
 
   /**
-   * Handler for GET /oauth/start - initiates Google OAuth flow for *caller*
-   * (already authenticated by the start token in http/server.ts).
+   * Create a one-time Google authorization URL from an already-authenticated
+   * MCP request. There is intentionally no unauthenticated /oauth/start hop:
+   * the scopes are fixed in Google's URL and repeated in the one-time state.
    */
-  async function startHandler(
-    request: FastifyRequest,
-    reply: FastifyReply,
-    caller: Caller
-  ): Promise<void> {
-    const query = request.query as {
-      scopes?: string;
-    };
-
-    // Parse requested scopes (comma-separated)
-    const requestedScopes = query.scopes
-      ? query.scopes.split(',').map(s => s.trim())
-      : ['gmail.readonly'];
-
-    // Validate scopes
-    let googleScopes: string[];
-    try {
-      googleScopes = mapScopes(requestedScopes);
-    } catch (error) {
-      reply.status(400).send({
-        error: 'invalid_scope',
-        error_description: (error as Error).message,
-      });
-      return;
+  async function createAuthorizationUrl(caller: Caller, scopes: string[]): Promise<string> {
+    if (!callerCan(caller, 'write')) {
+      throw new Error('A write-capability credential is required to authorize Gmail');
     }
+    const requestedScopes = [...new Set(scopes.map((scope) => scope.trim()).filter(Boolean))].sort();
+    if (
+      requestedScopes.length === 0 ||
+      requestedScopes.every((scope) => scope === 'gmail.labels')
+    ) {
+      throw new Error(
+        'At least one functional Gmail scope is required: gmail.readonly, gmail.modify, or gmail.compose'
+      );
+    }
+    const googleScopes = mapScopes(requestedScopes);
 
     // The grant will be stored under the caller the link was minted for.
     const mcpUserId = caller.id;
@@ -128,6 +138,7 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
     await tokenStore.saveOAuthState({
       state,
       mcpUserId,
+      credentialId: callerCredentialId(caller),
       expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
       scopes: requestedScopes,
       codeVerifier,
@@ -142,9 +153,7 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
       code_challenge: codeChallenge,
       code_challenge_method: CodeChallengeMethod.S256,
     });
-
-    // Redirect to Google
-    reply.redirect(authUrl);
+    return authUrl;
   }
 
   /**
@@ -189,6 +198,22 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
       return;
     }
 
+    // Removing or downgrading the exact write credential that minted the
+    // link invalidates the in-flight flow, even if a read sibling with the
+    // same caller id still exists.
+    const caller = callerByCredentialId(
+      config.callers,
+      storedState.mcpUserId,
+      storedState.credentialId
+    );
+    if (!caller || !callerCan(caller, 'write')) {
+      reply.status(403).send({
+        error: 'unknown_credential',
+        error_description: 'The credential that created this authorization link no longer exists or cannot write. Nothing was connected.',
+      });
+      return;
+    }
+
     try {
       const oauth2Client = newOAuth2Client();
       // Exchange code for tokens
@@ -204,6 +229,18 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
         });
         return;
       }
+
+      // A captured Google URL must not be broadened by editing its `scope`
+      // query parameter. Require every requested scope and reject any extra
+      // Gmail scope before storing the grant.
+      if (!grantedScopesExactlyMatch(storedState.scopes, tokens.scope)) {
+        reply.status(403).send({
+          error: 'scope_mismatch',
+          error_description: 'Google returned scopes different from the signed authorization request. Nothing was connected.',
+        });
+        return;
+      }
+      const expectedScopes = new Set(mapScopes(storedState.scopes));
 
       // Set credentials to fetch user profile
       oauth2Client.setCredentials(tokens);
@@ -224,16 +261,6 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
       // with a pinned account may only connect that account: storing any
       // other would succeed here but every tool call would still resolve the
       // pin and fail — a confusing half-connected state. Reject at the door.
-      // A caller whose token was removed since the link was minted gets
-      // nothing stored either.
-      const caller = callerById(config.callers, storedState.mcpUserId);
-      if (!caller) {
-        reply.status(403).send({
-          error: 'unknown_caller',
-          error_description: 'This authorization link belongs to a caller that no longer exists. Nothing was connected.',
-        });
-        return;
-      }
       const pinned = caller.account;
       if (pinned && profile.data.emailAddress.toLowerCase() !== pinned) {
         reply.status(403).type('text/html; charset=utf-8').send(`
@@ -269,7 +296,7 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
         accessToken: tokens.access_token,
         refreshToken: encryptedRefreshToken,
         expiryDate: tokens.expiry_date ?? Date.now() + 3600000,
-        scope: storedState.scopes.map(s => GMAIL_SCOPES[s as GmailScope]).join(' '),
+        scope: [...expectedScopes].join(' '),
         isDefault: isFirstAccount, // First account is default; additional accounts are not
       });
 
@@ -303,7 +330,7 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
   }
 
   return {
-    startHandler,
+    createAuthorizationUrl,
     callbackHandler,
     mapScopes,
   };

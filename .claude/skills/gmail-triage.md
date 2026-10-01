@@ -10,9 +10,9 @@ Analyze unread emails and prioritize them by urgency and action required.
 ## Steps
 
 1. Use `gmail_status` to verify authentication
-2. Use `gmail_batchSearchMessages` to gather emails in parallel:
+2. Use `gmail.searchMessages` with `queries` to gather emails in parallel:
    ```
-   gmail_batchSearchMessages({
+   gmail.searchMessages({
      queries: [
        { query: "is:unread in:inbox newer_than:1d", maxResults: 30 },
        { query: "is:unread in:inbox older_than:1d newer_than:7d", maxResults: 20 },

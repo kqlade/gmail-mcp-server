@@ -3,7 +3,7 @@
  * Supports multiple Gmail accounts per user.
  */
 export interface GmailCredentials {
-  /** MCP user ID (from JWT sub claim) */
+  /** MCP user ID selected by the authenticated bearer credential */
   mcpUserId: string;
   /** Google user ID */
   googleUserId: string;
@@ -43,6 +43,8 @@ export interface OAuthState {
   state: string;
   /** MCP user ID this state is bound to */
   mcpUserId: string;
+  /** Hash identifying the exact write credential that created the flow */
+  credentialId: string;
   /** When the state expires */
   expiresAt: Date;
   /** Requested scopes for this authorization */

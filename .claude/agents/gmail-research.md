@@ -1,7 +1,7 @@
 ---
 name: gmail-research
 description: Search and summarize emails on a topic. Use when user asks to find emails about something, summarize emails from someone, research a topic in email, or gather information from emails.
-tools: mcp__gmail-mcp__gmail_status, mcp__gmail-mcp__gmail_searchMessages, mcp__gmail-mcp__gmail_getMessage, mcp__gmail-mcp__gmail_getThread
+tools: mcp__gmail-read__gmail_status, mcp__gmail-read__gmail_searchMessages, mcp__gmail-read__gmail_getMessage, mcp__gmail-read__gmail_getThread
 model: inherit
 ---
 

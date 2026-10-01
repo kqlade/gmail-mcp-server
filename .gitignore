@@ -35,5 +35,5 @@ logs/
 tmp/
 temp/
 
-# Override global ignore for Claude settings
-!.claude/settings.local.json
+# Local Claude permissions may contain machine-specific broad grants.
+.claude/settings.local.json

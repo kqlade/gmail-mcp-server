@@ -11,9 +11,9 @@ Identify emails that can be archived to reduce inbox clutter.
 
 1. Use `gmail_status` to verify authentication
 2. Use `gmail_getLabelInfo` for INBOX to get total count
-3. Use `gmail_batchSearchMessages` to find cleanup candidates:
+3. Use `gmail.searchMessages` with `queries` to find cleanup candidates:
    ```
-   gmail_batchSearchMessages({
+   gmail.searchMessages({
      queries: [
        { query: "in:inbox older_than:30d", maxResults: 50 },
        { query: "in:inbox category:promotions", maxResults: 30 },
@@ -51,13 +51,13 @@ Top senders:
 ## Suggested Actions
 
 1. Archive all from {sender}? ({count} emails)
-   → gmail_archiveMessages({ threadIds: [...] })
+   → gmail.organizeMessages({ actions: [{ action: "archive", threadIds: [...] }] })
 
 2. Archive promotions older than 7 days? ({count} emails)
-   → gmail_archiveMessages({ threadIds: [...] })
+   → gmail.organizeMessages({ actions: [{ action: "archive", threadIds: [...] }] })
 
 3. Archive automated notifications? ({count} emails)
-   → gmail_archiveMessages({ threadIds: [...] })
+   → gmail.organizeMessages({ actions: [{ action: "archive", threadIds: [...] }] })
 
 Potential reduction: ~{count} emails ({percent}% of inbox)
 ```

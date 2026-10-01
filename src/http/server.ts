@@ -3,7 +3,7 @@ import type { Caller, Config } from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import type { McpServerInstance } from '../mcp/server.js';
 import { createGoogleOAuth } from '../auth/googleOAuth.js';
-import { resolveCaller, checkStartToken } from '../auth/bearer.js';
+import { resolveCaller } from '../auth/bearer.js';
 
 export interface HttpServerDependencies {
   config: Config;
@@ -104,22 +104,9 @@ export async function createHttpServer(deps: HttpServerDependencies): Promise<Fa
     });
   });
 
-  // Google OAuth endpoints. /oauth/start is opened in a browser (no bearer
-  // header possible), so it requires a short-lived HMAC start token that only
-  // the authenticated gmail.authorize tool can mint, signed with the caller's
-  // own secret: the resulting grant lands in that caller's row and no other.
-  server.get('/oauth/start', async (request: FastifyRequest, reply: FastifyReply) => {
-    const query = request.query as { caller?: string; exp?: string; sig?: string };
-    const caller = checkStartToken(query, config.callers);
-    if (!caller) {
-      reply.status(401).send({
-        error: 'unauthorized',
-        error_description: 'Missing or expired authorization link. Run gmail.authorize to get a fresh link.',
-      });
-      return;
-    }
-    return googleOAuth.startHandler(request, reply, caller);
-  });
+  // gmail.authorize returns Google's URL directly from an authenticated MCP
+  // request. The callback consumes one-time state bound to that exact write
+  // credential; there is no unauthenticated start endpoint.
   server.get('/oauth/callback', googleOAuth.callbackHandler);
 
   return server;

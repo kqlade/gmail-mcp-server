@@ -1,7 +1,7 @@
 ---
 name: gmail-triage
 description: Prioritize inbox by urgency. Use when user asks to triage emails, find urgent items, identify what needs attention, or prioritize their inbox.
-tools: mcp__gmail-mcp__gmail_status, mcp__gmail-mcp__gmail_searchMessages, mcp__gmail-mcp__gmail_getMessage, mcp__gmail-mcp__gmail_getLabelInfo
+tools: mcp__gmail-read__gmail_status, mcp__gmail-read__gmail_searchMessages, mcp__gmail-read__gmail_getMessage, mcp__gmail-read__gmail_getLabelInfo
 model: inherit
 ---
 

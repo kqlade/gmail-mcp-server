@@ -13,8 +13,9 @@ const CLAUDE_SKILLS_DIR = path.join(os.homedir(), '.claude', 'skills');
 const CLAUDE_AGENTS_DIR = path.join(os.homedir(), '.claude', 'agents');
 const LOCAL_SKILLS_DIR = path.join(__dirname, '..', '.claude', 'skills');
 const LOCAL_AGENTS_DIR = path.join(__dirname, '..', '.claude', 'agents');
-const MCP_SERVER_URL = 'http://localhost:3000/mcp';
-const MCP_SERVER_NAME = 'gmail-mcp';
+const ENV_PATH = path.join(__dirname, '..', '.env');
+const MCP_SERVER_NAMES = ['gmail-read', 'gmail-write'];
+const LEGACY_MCP_SERVER_NAME = 'gmail-mcp';
 const SKILL_PREFIX = 'gmail-';
 const AGENT_PREFIX = 'gmail-';
 
@@ -63,31 +64,95 @@ function readClaudeConfig() {
 // Write Claude config file
 function writeClaudeConfig(config) {
   fs.writeFileSync(CLAUDE_CONFIG, JSON.stringify(config, null, 2) + '\n');
+  fs.chmodSync(CLAUDE_CONFIG, 0o600);
+}
+
+function readLocalCredentials() {
+  if (!fs.existsSync(ENV_PATH)) {
+    throw new Error('Missing .env. Run npm run setup:secrets first.');
+  }
+  const env = {};
+  for (const rawLine of fs.readFileSync(ENV_PATH, 'utf-8').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const equals = line.indexOf('=');
+    if (equals < 1) continue;
+    env[line.slice(0, equals)] = line.slice(equals + 1).replace(/^["']|["']$/g, '');
+  }
+  const rawEntries = String(env.MCP_AUTH_TOKENS ?? '')
+    .split(/[\n,]/)
+    .map((entry) => entry.trim().split(':'))
+    .filter((parts) => parts.some(Boolean));
+  const pairs = new Map();
+  for (const parts of rawEntries) {
+    const [id, token, account, capability] = parts;
+    if (
+      parts.length !== 4 ||
+      !id ||
+      !token ||
+      !account ||
+      (capability !== 'read' && capability !== 'write')
+    ) {
+      throw new Error('MCP_AUTH_TOKENS contains a malformed entry.');
+    }
+    const key = `${id.toLowerCase()}\0${account.toLowerCase()}`;
+    const pair = pairs.get(key) ?? { id: id.toLowerCase(), account: account.toLowerCase() };
+    if (pair[capability]) {
+      throw new Error(`MCP_AUTH_TOKENS repeats ${capability} for ${pair.id}.`);
+    }
+    pair[capability] = token;
+    pairs.set(key, pair);
+  }
+  const requestedId = String(env.CLAUDE_GMAIL_CALLER_ID ?? '').trim().toLowerCase();
+  const completePairs = [...pairs.values()].filter(
+    (pair) => pair.read && pair.write && (!requestedId || pair.id === requestedId)
+  );
+  if (completePairs.length !== 1) {
+    throw new Error(
+      completePairs.length === 0
+        ? 'MCP_AUTH_TOKENS must contain a matching pinned read/write pair.'
+        : 'Multiple caller pairs exist; set CLAUDE_GMAIL_CALLER_ID in .env to choose one.'
+    );
+  }
+  const [{ read, write }] = completePairs;
+  const baseUrl = String(env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '');
+  return { read, write, url: `${baseUrl}/mcp` };
 }
 
 // Check if MCP server is installed
 function isMcpServerInstalled() {
   const config = readClaudeConfig();
-  return config.mcpServers?.[MCP_SERVER_NAME] !== undefined;
+  return MCP_SERVER_NAMES.every((name) => config.mcpServers?.[name] !== undefined);
 }
 
 // Install MCP server to ~/.claude.json
 function installMcpServer() {
   const config = readClaudeConfig();
+  const credentials = readLocalCredentials();
 
   if (!config.mcpServers) {
     config.mcpServers = {};
   }
 
-  const wasInstalled = config.mcpServers[MCP_SERVER_NAME] !== undefined;
-  config.mcpServers[MCP_SERVER_NAME] = { url: MCP_SERVER_URL };
+  const wasInstalled = isMcpServerInstalled();
+  delete config.mcpServers[LEGACY_MCP_SERVER_NAME];
+  config.mcpServers['gmail-read'] = {
+    type: 'http',
+    url: credentials.url,
+    headers: { Authorization: `Bearer ${credentials.read}` },
+  };
+  config.mcpServers['gmail-write'] = {
+    type: 'http',
+    url: credentials.url,
+    headers: { Authorization: `Bearer ${credentials.write}` },
+  };
 
   writeClaudeConfig(config);
 
   if (wasInstalled) {
-    info(`Updated ${MCP_SERVER_NAME} in ~/.claude.json`);
+    info('Updated gmail-read and gmail-write in ~/.claude.json');
   } else {
-    success(`Added ${MCP_SERVER_NAME} to ~/.claude.json`);
+    success('Added authenticated gmail-read and gmail-write connections to ~/.claude.json');
   }
 
   return true;
@@ -96,15 +161,16 @@ function installMcpServer() {
 // Uninstall MCP server from ~/.claude.json
 function uninstallMcpServer() {
   const config = readClaudeConfig();
-
-  if (config.mcpServers?.[MCP_SERVER_NAME]) {
-    delete config.mcpServers[MCP_SERVER_NAME];
+  const names = [...MCP_SERVER_NAMES, LEGACY_MCP_SERVER_NAME];
+  const installed = names.filter((name) => config.mcpServers?.[name]);
+  if (installed.length > 0) {
+    for (const name of installed) delete config.mcpServers[name];
     writeClaudeConfig(config);
-    removed(`Removed ${MCP_SERVER_NAME} from ~/.claude.json`);
+    removed(`Removed ${installed.join(', ')} from ~/.claude.json`);
     return true;
   }
 
-  info(`${MCP_SERVER_NAME} not found in ~/.claude.json`);
+  info('Gmail MCP connections not found in ~/.claude.json');
   return false;
 }
 
@@ -260,7 +326,7 @@ function showStatus() {
   header('MCP Server');
   if (isMcpServerInstalled()) {
     const config = readClaudeConfig();
-    success(`Installed (${config.mcpServers[MCP_SERVER_NAME].url})`);
+    success(`Installed read/write (${config.mcpServers['gmail-read'].url})`);
   } else {
     info('Not installed');
   }

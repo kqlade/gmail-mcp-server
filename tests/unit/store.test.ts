@@ -325,6 +325,7 @@ describe('SqliteTokenStore', () => {
     const testState = {
       state: 'random-state-token-abc',
       mcpUserId: 'user-123',
+      credentialId: 'credential-fingerprint-123',
       expiresAt: new Date(Date.now() + 600000), // 10 minutes
       scopes: ['gmail.readonly'],
       codeVerifier: 'pkce-code-verifier-xyz',
@@ -336,6 +337,7 @@ describe('SqliteTokenStore', () => {
       const consumed = await store.consumeOAuthState(testState.state);
       expect(consumed).not.toBeNull();
       expect(consumed?.mcpUserId).toBe(testState.mcpUserId);
+      expect(consumed?.credentialId).toBe(testState.credentialId);
       expect(consumed?.scopes).toEqual(testState.scopes);
       expect(consumed?.codeVerifier).toBe(testState.codeVerifier);
 

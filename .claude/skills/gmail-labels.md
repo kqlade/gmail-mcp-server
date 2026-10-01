@@ -1,16 +1,17 @@
 ---
 name: gmail-labels
-description: List all Gmail labels with message counts
+description: List Gmail labels with targeted message counts
 ---
 
 # /gmail-labels - View Labels
 
-List all Gmail labels with their message counts.
+List label names and show counts only for labels fetched explicitly.
 
 ## Steps
 
 1. Use `gmail_status` to verify authentication
-2. Use `gmail_listLabels` to get all labels
+2. Use `gmail_listLabels` to get IDs, names, and types
+3. Use `gmail_getLabelInfo` for INBOX, UNREAD, STARRED, SENT, DRAFT, SPAM, and TRASH; fetch custom-label counts only when the user asks
 
 ## Output Format
 
@@ -26,17 +27,17 @@ System Labels:
 • TRASH: {count}
 
 Custom Labels:
-• {label_name}: {total} ({unread} unread)
-• {label_name}: {total}
-• {parent}/{child}: {total}
+• {label_name}
+• {label_name}
+• {parent}/{child}
 ...
 ```
 
 ## Notes
 
 - Separate system labels from custom labels
-- Show unread count only if > 0
+- `gmail_listLabels` does not return counts; never infer them
+- Show unread count only when returned by `gmail_getLabelInfo`
 - Show nested labels with their hierarchy (parent/child)
 - Sort custom labels alphabetically
-- Skip labels with 0 messages unless they're system labels
 - If no custom labels exist, note that user can create them

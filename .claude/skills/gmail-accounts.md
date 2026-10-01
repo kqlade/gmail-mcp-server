@@ -1,11 +1,11 @@
 ---
 name: gmail-accounts
-description: View connected Gmail accounts and current default
+description: View the Gmail account pinned to this connection
 ---
 
 # /gmail-accounts - View Connected Accounts
 
-Show all connected Gmail accounts and which is set as default.
+Show the account this caller is pinned to and whether it is connected.
 
 ## Steps
 
@@ -21,8 +21,7 @@ Show all connected Gmail accounts and which is set as default.
 • {email}
 • {email}
 
-Use /gmail-connect to add another account
-Use gmail_setDefaultAccount to change default
+The bearer credential is pinned to this account; it cannot switch mailboxes.
 ```
 
 ### If no accounts connected:
@@ -34,7 +33,6 @@ Use /gmail-connect to authorize a Gmail account
 
 ## Notes
 
-- Clearly indicate which account is the default
-- Default account is used when no email parameter is specified in tools
-- If only one account, still show it with (default) marker
-- Remind user how to add more accounts or change default
+- Clearly indicate the pinned account and connection status
+- There is no per-call email parameter or default-account mutation
+- To use another mailbox, provision a separate pinned caller credential
