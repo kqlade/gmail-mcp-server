@@ -1,9 +1,9 @@
 import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import type { Config } from '../config.js';
+import type { Caller, Config } from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import type { McpServerInstance } from '../mcp/server.js';
 import { createGoogleOAuth } from '../auth/googleOAuth.js';
-import { checkBearerToken, checkStartToken } from '../auth/bearer.js';
+import { resolveCaller, checkStartToken } from '../auth/bearer.js';
 
 export interface HttpServerDependencies {
   config: Config;
@@ -64,24 +64,33 @@ export async function createHttpServer(deps: HttpServerDependencies): Promise<Fa
     }
   });
 
-  // MCP Streamable HTTP endpoint (stateless; bearer-token protected)
+  // MCP Streamable HTTP endpoint (stateless; bearer token names the caller)
   server.post(
     '/mcp',
     {
       preHandler: async (request, reply) => {
-        if (!checkBearerToken(request.headers.authorization, config.mcpAuthToken)) {
+        const caller = resolveCaller(request.headers.authorization, config.callers);
+        if (!caller) {
           reply.status(401).header('WWW-Authenticate', 'Bearer').send({
             jsonrpc: '2.0',
             error: { code: -32001, message: 'Unauthorized' },
             id: null,
           });
+          return;
         }
+        (request as FastifyRequest & { caller?: Caller }).caller = caller;
       },
     },
     async (request: FastifyRequest, reply: FastifyReply) => {
+      const caller = (request as FastifyRequest & { caller?: Caller }).caller;
+      if (!caller) {
+        // preHandler always sets this for an authenticated request; fail closed anyway.
+        reply.status(401).send({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+        return;
+      }
       const req = request.raw;
       const res = reply.raw;
-      await mcpServer.handleRequest(req, res, request.body);
+      await mcpServer.handleRequest(req, res, request.body, caller);
       reply.hijack();
     }
   );
@@ -97,17 +106,19 @@ export async function createHttpServer(deps: HttpServerDependencies): Promise<Fa
 
   // Google OAuth endpoints. /oauth/start is opened in a browser (no bearer
   // header possible), so it requires a short-lived HMAC start token that only
-  // the authenticated gmail.authorize tool can mint.
+  // the authenticated gmail.authorize tool can mint, signed with the caller's
+  // own secret: the resulting grant lands in that caller's row and no other.
   server.get('/oauth/start', async (request: FastifyRequest, reply: FastifyReply) => {
-    const query = request.query as { exp?: string; sig?: string };
-    if (!checkStartToken(query.exp, query.sig, config.mcpAuthToken)) {
+    const query = request.query as { caller?: string; exp?: string; sig?: string };
+    const caller = checkStartToken(query, config.callers);
+    if (!caller) {
       reply.status(401).send({
         error: 'unauthorized',
         error_description: 'Missing or expired authorization link. Run gmail.authorize to get a fresh link.',
       });
       return;
     }
-    return googleOAuth.startHandler(request, reply);
+    return googleOAuth.startHandler(request, reply, caller);
   });
   server.get('/oauth/callback', googleOAuth.callbackHandler);
 

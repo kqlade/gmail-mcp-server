@@ -12,7 +12,7 @@ import { google } from 'googleapis';
 import { CodeChallengeMethod } from 'google-auth-library';
 import { randomBytes, createHash } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
-import { MCP_USER_ID, type Config } from '../config.js';
+import { callerById, type Caller, type Config } from '../config.js';
 import type { TokenStore } from '../store/interface.js';
 import { encrypt } from '../utils/crypto.js';
 
@@ -31,6 +31,12 @@ const VALID_SCOPES = new Set<string>(Object.keys(GMAIL_SCOPES));
 export interface GoogleOAuthDependencies {
   config: Config;
   tokenStore: TokenStore;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>
+  )[ch] ?? ch);
 }
 
 /**
@@ -54,8 +60,10 @@ function generatePKCE(): { codeVerifier: string; codeChallenge: string } {
 export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
   const { config, tokenStore } = deps;
 
-  // Create OAuth2 client
-  const oauth2Client = new google.auth.OAuth2(
+  // OAuth2Client carries mutable credentials. A fresh instance per request
+  // prevents simultaneous callbacks for different callers from overwriting
+  // one another between setCredentials() and users.getProfile().
+  const newOAuth2Client = () => new google.auth.OAuth2(
     config.googleClientId,
     config.googleClientSecret,
     config.oauthRedirectUri
@@ -78,11 +86,13 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
   }
 
   /**
-   * Handler for GET /oauth/start - initiates Google OAuth flow.
+   * Handler for GET /oauth/start - initiates Google OAuth flow for *caller*
+   * (already authenticated by the start token in http/server.ts).
    */
   async function startHandler(
     request: FastifyRequest,
-    reply: FastifyReply
+    reply: FastifyReply,
+    caller: Caller
   ): Promise<void> {
     const query = request.query as {
       scopes?: string;
@@ -105,8 +115,8 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
       return;
     }
 
-    // Single-operator deployment: all accounts belong to the fixed identity.
-    const mcpUserId = MCP_USER_ID;
+    // The grant will be stored under the caller the link was minted for.
+    const mcpUserId = caller.id;
 
     // Generate state token (256-bit random)
     const state = randomBytes(32).toString('base64url');
@@ -124,7 +134,7 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
     });
 
     // Generate Google authorization URL
-    const authUrl = oauth2Client.generateAuthUrl({
+    const authUrl = newOAuth2Client().generateAuthUrl({
       access_type: 'offline',
       scope: googleScopes,
       state,
@@ -180,6 +190,7 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
     }
 
     try {
+      const oauth2Client = newOAuth2Client();
       // Exchange code for tokens
       const { tokens } = await oauth2Client.getToken({
         code: query.code,
@@ -206,6 +217,39 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
           error: 'profile_error',
           error_description: 'Failed to get email address from Gmail',
         });
+        return;
+      }
+
+      // The state was bound to a caller when the link was minted. A caller
+      // with a pinned account may only connect that account: storing any
+      // other would succeed here but every tool call would still resolve the
+      // pin and fail — a confusing half-connected state. Reject at the door.
+      // A caller whose token was removed since the link was minted gets
+      // nothing stored either.
+      const caller = callerById(config.callers, storedState.mcpUserId);
+      if (!caller) {
+        reply.status(403).send({
+          error: 'unknown_caller',
+          error_description: 'This authorization link belongs to a caller that no longer exists. Nothing was connected.',
+        });
+        return;
+      }
+      const pinned = caller.account;
+      if (pinned && profile.data.emailAddress.toLowerCase() !== pinned) {
+        reply.status(403).type('text/html; charset=utf-8').send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Wrong Google Account</title>
+        </head>
+        <body>
+          <h1>Wrong Google Account</h1>
+          <p>You authorized <strong>${escapeHtml(profile.data.emailAddress)}</strong>, but this connection is for <strong>${escapeHtml(pinned)}</strong>.</p>
+          <p>Nothing was connected. Restart the flow and pick ${escapeHtml(pinned)} in the Google account chooser.</p>
+        </body>
+        </html>
+      `);
         return;
       }
 
@@ -243,7 +287,7 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
         </head>
         <body>
           <h1>Gmail ${action.charAt(0).toUpperCase() + action.slice(1)}</h1>
-          <p>Successfully ${action} as <strong>${profile.data.emailAddress}</strong></p>
+          <p>Successfully ${action} as <strong>${escapeHtml(profile.data.emailAddress)}</strong></p>
           <p>You now have ${accountCount} Gmail account${accountCount > 1 ? 's' : ''} connected.</p>
           <p>You can now close this window and return to your application.</p>
         </body>
@@ -259,7 +303,6 @@ export function createGoogleOAuth(deps: GoogleOAuthDependencies) {
   }
 
   return {
-    oauth2Client,
     startHandler,
     callbackHandler,
     mapScopes,

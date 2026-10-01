@@ -1,16 +1,20 @@
 /**
- * Static bearer-token auth for the MCP endpoint.
+ * Bearer-token auth for the MCP endpoint, per caller.
  *
- * This server is single-operator: one shared secret (MCP_AUTH_TOKEN) is held
- * by the MCP client (e.g. Hermes) and sent as `Authorization: Bearer <token>`.
+ * Each caller (one person's Ripple compartment) holds its own token and sends
+ * it as `Authorization: Bearer <token>`. The token is the identity: it selects
+ * the mcpUserId whose Gmail credentials a request may touch, and nothing in
+ * the request body can override it.
  *
  * The Google OAuth start URL is opened in a browser, where we can't send the
  * bearer header. Instead, the authenticated gmail.authorize tool embeds a
- * short-lived HMAC "start token" (derived from the secret, never the secret
- * itself) in the URL, which /oauth/start validates.
+ * short-lived HMAC "start token" in the URL: the caller id in clear plus a
+ * signature derived from THAT caller's secret, so a link minted for one
+ * person cannot start an OAuth flow that lands in another person's row.
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { callerCan, callerForToken, type Caller } from '../config.js';
 
 const START_TOKEN_TTL_MS = 10 * 60 * 1000;
 
@@ -21,33 +25,50 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(bufA, bufB);
 }
 
-/** Validate an Authorization header against the configured secret. */
-export function checkBearerToken(authorizationHeader: string | undefined, secret: string): boolean {
-  if (!authorizationHeader) return false;
+/** Extract the bearer token from an Authorization header. */
+export function bearerToken(authorizationHeader: string | undefined): string {
+  if (!authorizationHeader) return '';
   const match = /^Bearer\s+(.+)$/i.exec(authorizationHeader.trim());
-  if (!match) return false;
-  return safeEqual(match[1]!, secret);
+  return match ? match[1]!.trim() : '';
 }
 
-function signStartToken(expiresAtMs: number, secret: string): string {
-  return createHmac('sha256', secret).update(`oauth-start:${expiresAtMs}`).digest('base64url');
+/** The caller an Authorization header authenticates, or null. */
+export function resolveCaller(authorizationHeader: string | undefined, callers: Caller[]): Caller | null {
+  return callerForToken(callers, bearerToken(authorizationHeader));
 }
 
-/** Create `exp` + `sig` query params authorizing one /oauth/start visit window. */
-export function createStartToken(secret: string, now = Date.now()): { exp: string; sig: string } {
+function signStartToken(callerId: string, expiresAtMs: number, secret: string): string {
+  return createHmac('sha256', secret).update(`oauth-start:${callerId}:${expiresAtMs}`).digest('base64url');
+}
+
+/** Create `caller` + `exp` + `sig` query params authorizing one /oauth/start visit window for *caller*. */
+export function createStartToken(caller: Caller, now = Date.now()): { caller: string; exp: string; sig: string } {
   const expiresAtMs = now + START_TOKEN_TTL_MS;
-  return { exp: String(expiresAtMs), sig: signStartToken(expiresAtMs, secret) };
+  return { caller: caller.id, exp: String(expiresAtMs), sig: signStartToken(caller.id, expiresAtMs, caller.token) };
 }
 
-/** Validate `exp` + `sig` query params produced by createStartToken. */
+/** Validate start-token query params; returns the caller the link was minted for, or null. */
 export function checkStartToken(
-  exp: string | undefined,
-  sig: string | undefined,
-  secret: string,
+  query: { caller?: string; exp?: string; sig?: string },
+  callers: Caller[],
   now = Date.now()
-): boolean {
-  if (!exp || !sig) return false;
+): Caller | null {
+  const { caller: callerId, exp, sig } = query;
+  if (!callerId || !exp || !sig) return null;
   const expiresAtMs = Number(exp);
-  if (!Number.isFinite(expiresAtMs) || expiresAtMs < now) return false;
-  return safeEqual(sig, signStartToken(expiresAtMs, secret));
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs < now) return null;
+  // One mailbox identity may have separate read and write credentials. Test
+  // every write credential for the id: a read token must not turn its bearer
+  // secret into a direct /oauth/start mutation path.
+  let matched: Caller | null = null;
+  for (const caller of callers) {
+    if (caller.id !== callerId) continue;
+    if (
+      callerCan(caller, 'write') &&
+      safeEqual(sig, signStartToken(caller.id, expiresAtMs, caller.token))
+    ) {
+      matched = caller;
+    }
+  }
+  return matched;
 }

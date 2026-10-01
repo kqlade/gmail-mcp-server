@@ -27,7 +27,7 @@ npm run setup:secrets     # Generate encryption keys for .env
 
 ## Architecture Overview
 
-This is an MCP (Model Context Protocol) server that exposes Gmail inbox tools via Streamable HTTP transport. It implements two-layer OAuth: MCP-level JWT authentication and Google OAuth for Gmail access. Supports **multi-inbox**: users can connect multiple Gmail accounts and switch between them.
+This is an MCP (Model Context Protocol) server that exposes Gmail inbox tools via Streamable HTTP transport. It implements bearer capability authentication and Google OAuth for Gmail access. Each token names **one person's identity** and carries a server-enforced read or write capability; an identity may be pinned to one Google account, and no caller can target another person's mailbox.
 
 ### Core Data Flow
 
@@ -53,18 +53,20 @@ MCP Client → Fastify HTTP (/mcp) → MCP Server → Gmail Client → Google AP
 1. **MCP-level**: JWT access tokens (HS256, 1hr lifetime) with `sub` claim as user identity
 2. **Gmail-level**: Google OAuth tokens stored per MCP user; supports readonly, labels, modify, compose scopes
 
-### Multi-Account Support
+### Callers
 
-- Users can connect multiple Gmail accounts per MCP user ID
-- First account becomes the default automatically
-- All tools accept optional `email` parameter to target specific account (defaults to default account)
-- `gmail.listAccounts` lists connected accounts; `gmail.setDefaultAccount` changes default; `gmail.removeAccount` disconnects an account
-- Database uses composite primary key `(mcp_user_id, email)`
+- A credential is one bearer token plus the identity and capability it unlocks (`Caller` in `src/config.ts`). `MCP_AUTH_TOKENS` holds `id:token[:account[:read|write|read+write]]` entries; use separate read and write entries with the same id/account. The legacy `MCP_AUTH_TOKEN` is all-capability caller `primary`, optionally pinned by `GMAIL_ACCOUNT`.
+- The token alone selects the `mcpUserId`; nothing in a request body can name another person. `buildServer(caller)` in `src/mcp/server.ts` closes every tool over the caller.
+- A caller with a pinned `account` operates only on that Google account and the OAuth callback rejects any other; an unpinned caller operates on the account they connected (their default row). There is no per-call `email` parameter either way.
+- `gmail.authorize` mints a start link signed with the caller's own token (`caller`, `exp`, `sig`), so `/oauth/start` binds `OAuthState.mcpUserId` to that caller and a link cannot land a grant in someone else's row.
+- Credential resolution happens server-side in `getValidCredentials` (client.ts), with a case-insensitive fallback against the stored address for pinned callers
+- `gmail.listAccounts` is read-only visibility; `gmail.setDefaultAccount` / `gmail.removeAccount` were removed on purpose
+- Database keeps the composite primary key `(mcp_user_id, email)` from the multi-account era
 
 ### Tool Categories (27 tools)
 
 - Status/Auth: `gmail.status`, `gmail.authorize`
-- Account Management: `gmail.listAccounts`, `gmail.setDefaultAccount`, `gmail.removeAccount`
+- Account Visibility: `gmail.listAccounts` (read-only)
 - Read: `gmail.searchMessages`, `gmail.batchSearchMessages`, `gmail.getMessage`, `gmail.listThreads`, `gmail.getThread`, `gmail.getAttachmentMetadata`
 - Labels: `gmail.getLabelInfo`, `gmail.listLabels`, `gmail.addLabels`, `gmail.removeLabels`, `gmail.createLabel`
 - Modifications: `gmail.archiveMessages`, `gmail.unarchiveMessages`, `gmail.markAsRead`, `gmail.markAsUnread`, `gmail.starMessages`, `gmail.unstarMessages`

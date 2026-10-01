@@ -4,7 +4,7 @@ An MCP (Model Context Protocol) server that exposes Gmail inbox tools via Stream
 
 ## Features
 
-- **Multi-account support** - Connect multiple Gmail accounts and switch between them
+- **Pinned account** - The server operates on one hardcoded Gmail account; callers can never route to another
 - **Full Gmail access** - Search messages, read threads, manage labels, archive, star, and compose drafts
 - **Secure token storage** - Refresh tokens encrypted with AES-256-GCM in SQLite
 - **Two-layer OAuth** - MCP-level JWT authentication plus Google OAuth for Gmail
@@ -131,7 +131,8 @@ Create a `.env` file based on `.env.example`:
 | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret | Yes |
 | `OAUTH_REDIRECT_URI` | OAuth callback URL | Yes |
 | `TOKEN_ENCRYPTION_KEY` | 32-byte base64 key for token encryption | Yes |
-| `JWT_SECRET` | Secret for MCP JWT tokens | Yes |
+| `MCP_AUTH_TOKENS` | Capability credentials: `id:token[:account[:read\|write\|read+write]]` entries, comma- or newline-separated. Use separate `read` and `write` tokens with the same id/account | One of these |
+| `MCP_AUTH_TOKEN` | Legacy single caller (`primary`); `GMAIL_ACCOUNT` optionally pins its account | One of these |
 | `DB_URL` | SQLite database path (default: `./data/gmail-mcp.db`) | No |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins | No |
 
@@ -140,15 +141,13 @@ Create a `.env` file based on `.env.example`:
 ### Authorization & Status
 | Tool | Description |
 |------|-------------|
-| `gmail.status` | Check connection status and list connected accounts |
-| `gmail.authorize` | Initiate OAuth flow to connect a Gmail account |
+| `gmail.status` | Check whether this caller's account is connected |
+| `gmail.authorize` | Initiate OAuth flow to connect this caller's account |
 
-### Account Management
+### Account Visibility
 | Tool | Description |
 |------|-------------|
-| `gmail.listAccounts` | List all connected Gmail accounts |
-| `gmail.setDefaultAccount` | Set the default account for operations |
-| `gmail.removeAccount` | Disconnect a Gmail account |
+| `gmail.listAccounts` | List this caller's connected accounts (read-only; the operating account is resolved from the caller) |
 
 ### Reading Email
 | Tool | Description |
@@ -199,21 +198,36 @@ Request only the scopes you need:
 | `gmail.modify` | All of the above |
 | `gmail.compose` | Create and manage drafts |
 
-## Multi-Account Support
+## Callers
 
-Connect multiple Gmail accounts per user:
+Every request carries a bearer token. `MCP_AUTH_TOKENS` maps it to a caller id
+(a person's handle), a server-enforced `read` or `write` capability, and,
+optionally, the one Google account that caller may connect. Credentials are
+stored per caller, so two people share one deployment without seeing each
+other's mail, and a read token cannot advertise or invoke mutation tools.
 
-```
-// First account becomes the default
-gmail.authorize → connects work@company.com (default)
-gmail.authorize → connects personal@gmail.com
+- Every tool resolves credentials for the caller's account; there is no
+  per-call `email` parameter. Agent callers used to hallucinate addresses and
+  burn entire sessions on "account not connected" retry loops.
+- A pinned credential (`id:token:account:read` or `:write`) can only connect that account: the
+  OAuth callback rejects any other, so a wrong pick in the account chooser
+  can't create a half-connected state. An unpinned caller operates on
+  whichever account they connected.
+- `gmail.authorize` links are signed with the caller's own token, so a link
+  minted for one person cannot land a grant in another person's row.
+- `gmail.setDefaultAccount` / `gmail.removeAccount` were removed: switching is
+  meaningless and disconnecting would let a confused agent brick email access.
 
-// Use specific account
-gmail.searchMessages(query: "...", email: "personal@gmail.com")
-
-// Or change the default
-gmail.setDefaultAccount(email: "personal@gmail.com")
-```
+Adding a person: mint two tokens (`openssl rand -base64 32` twice), append
+`handle:read-token:their@address:read` and
+`handle:write-token:their@address:write` to `MCP_AUTH_TOKENS`, redeploy, put
+them in Ripple as `MCP_GMAIL_READ_API_KEY` and
+`MCP_GMAIL_WRITE_API_KEY`, and have them run `gmail.authorize` through the
+write surface. The legacy `MCP_AUTH_TOKEN` remains an all-capability migration
+fallback for an existing single-person deployment. For a zero-downtime
+cutover, capability entries using id `primary` may temporarily coexist with
+the legacy token; switch clients to the scoped tokens, verify them, then remove
+`MCP_AUTH_TOKEN`.
 
 ## Docker Deployment
 

@@ -49,17 +49,6 @@ export class InvalidArgumentError extends McpError {
   }
 }
 
-export class AccountNotFoundError extends McpError {
-  constructor(email: string) {
-    super(
-      ErrorCodes.INVALID_ARGUMENT,
-      `Gmail account ${email} is not connected. Use gmail.listAccounts to see connected accounts.`,
-      { email }
-    );
-    this.name = 'AccountNotFoundError';
-  }
-}
-
 export class GmailApiError extends McpError {
   constructor(message: string, public readonly httpStatus?: number, data?: Record<string, unknown>) {
     super(ErrorCodes.GMAIL_API_ERROR, message, { ...data, httpStatus });
